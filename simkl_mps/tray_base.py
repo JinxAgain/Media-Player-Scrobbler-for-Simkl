@@ -1204,6 +1204,41 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             self.show_notification("Error", f"Failed to toggle rewatch scrobbling: {e}")
 
         return 0
+
+    def toggle_realtime_scrobble(self, _=None):
+        """Toggle real-time scrobble (watching now / pause) on/off from the tray menu."""
+        try:
+            current_value = get_setting('enable_realtime_scrobble', True)
+            new_value = not current_value
+            set_setting('enable_realtime_scrobble', new_value)
+
+            status = "enabled" if new_value else "disabled"
+            logger.info(f"Real-time scrobbling {status} via tray menu")
+            self.update_icon()
+            self.show_notification("Settings Updated", f"Real-time scrobbling {status}.")
+        except Exception as e:
+            logger.error(f"Error toggling real-time scrobbling: {e}", exc_info=True)
+            self.show_notification("Error", f"Failed to toggle real-time scrobbling: {e}")
+
+        return 0
+
+    def toggle_playback_resume(self, _=None):
+        """Toggle reverse playback resume on/off from the tray menu."""
+        try:
+            current_value = get_setting('enable_playback_resume', True)
+            new_value = not current_value
+            set_setting('enable_playback_resume', new_value)
+
+            status = "enabled" if new_value else "disabled"
+            logger.info(f"Playback resume {status} via tray menu")
+            self.update_icon()
+            self.show_notification("Settings Updated", f"Playback auto-resume {status}.")
+        except Exception as e:
+            logger.error(f"Error toggling playback resume: {e}", exc_info=True)
+            self.show_notification("Error", f"Failed to toggle playback resume: {e}")
+
+        return 0
+
     
     def check_first_run(self):
         """Check if this is the first time the app is being run"""
@@ -1256,6 +1291,16 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
                 "Record Rewatches",
                 self.toggle_rewatch_enabled,
                 checked=lambda item, _allowed=can_record_rewatches: get_setting('allow_rewatch', True) if _allowed else False
+            ),
+            pystray.MenuItem(
+                "Realtime Scrobbling (Watching Now)",
+                self.toggle_realtime_scrobble,
+                checked=lambda item: get_setting('enable_realtime_scrobble', True)
+            ),
+            pystray.MenuItem(
+                "Auto-Resume from Simkl",
+                self.toggle_playback_resume,
+                checked=lambda item: get_setting('enable_playback_resume', True)
             ),
             pystray.MenuItem(
                 "Turn Notifications Off",

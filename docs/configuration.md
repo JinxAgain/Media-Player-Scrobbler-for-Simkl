@@ -49,6 +49,9 @@ Example `settings.json`:
 ```json
 {
   "watch_completion_threshold": 80,
+  "enable_realtime_scrobble": true,
+  "enable_playback_resume": true,
+  "resume_start_tolerance_seconds": 30,
   "auto_sync_interval": 120,
   "disable_notifications": false,
   "allow_dirs": [
@@ -60,6 +63,16 @@ Example `settings.json`:
   ]
 }
 ```
+
+### Real-Time Scrobbling & Playback Resume
+
+MPS for SIMKL supports real-time watch state reporting and reverse resume synchronization with the Simkl Playback Progress Manager:
+
+- **`enable_realtime_scrobble`** (default: `true`): Reports live playback state (`start` and `pause`) to Simkl so your profile displays "Watching now". When playback stops before reaching `watch_completion_threshold` (with at least 30 seconds watched and progress $\ge$ 2%), your exact progress is saved to Simkl via `/scrobble/pause`. This avoids server-side auto-completion and respects any custom threshold (e.g. 65% or 90%).
+- **`enable_playback_resume`** (default: `true`): When opening media in supported players (such as MPV or MPV wrappers), checks your unfinished playbacks on Simkl. If the saved position is between 2% and your completion threshold, the player automatically seeks to that timestamp and shows an on-screen notification.
+- **`resume_start_tolerance_seconds`** (default: `30`): Maximum playback position (in seconds) allowed when opening media for auto-resume to trigger. If you have already played further than this tolerance, automatic seek is skipped.
+- When an item completes, any saved unfinished playback session is automatically cleared from your Simkl Playback Progress Manager.
+
 
 ### Notifications
 
