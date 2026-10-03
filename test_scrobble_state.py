@@ -440,3 +440,35 @@ def test_clear_saved_playback_swallows_errors(tmp_path, monkeypatch):
     # Should not raise exception
     scrobbler._clear_saved_playback()
 
+
+def test_stop_short_watch_time_with_reported_start_reports_pause(tmp_path, clock_and_recorder):
+    _, calls = clock_and_recorder
+    scrobbler = _make_scrobbler(tmp_path)
+    scrobbler._scrobble_reported_state = "start"
+    scrobbler.watch_time = 15.0  # < 30s
+    scrobbler.completion_threshold = 80.0
+    scrobbler.total_duration_seconds = 1000.0
+    scrobbler.current_position_seconds = 185.0  # 18.5%
+
+    res = scrobbler.stop_tracking()
+    assert res is not None
+    assert len(calls) == 1
+    assert calls[0]["action"] == "pause"
+    assert calls[0]["progress"] == 18.5
+
+
+def test_stop_short_watch_time_below_min_progress_with_reported_start_reports_stop(tmp_path, clock_and_recorder):
+    _, calls = clock_and_recorder
+    scrobbler = _make_scrobbler(tmp_path)
+    scrobbler._scrobble_reported_state = "start"
+    scrobbler.watch_time = 10.0  # < 30s
+    scrobbler.completion_threshold = 80.0
+    scrobbler.total_duration_seconds = 1000.0
+    scrobbler.current_position_seconds = 10.0  # 1.0% (< 2.0%)
+
+    res = scrobbler.stop_tracking()
+    assert res is not None
+    assert len(calls) == 1
+    assert calls[0]["action"] == "stop"
+    assert calls[0]["progress"] == 1.0
+

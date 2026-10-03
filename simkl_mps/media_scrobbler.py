@@ -1251,17 +1251,29 @@ class MediaScrobbler:
                 logger.info(f"'{final_movie_name or final_raw_title}' met completion threshold upon stopping.")
                 # Attempt to add to history if not already done
                 self._attempt_add_to_history() # This might set self.completed
-            elif (
+            has_reported_scrobble = (self._scrobble_reported_state is not None)
+            should_save_progress = (
                 get_setting("enable_realtime_scrobble", True)
-                and self.watch_time >= self.MIN_REPORT_WATCH_SECONDS
                 and final_completion_pct is not None
                 and threshold is not None
                 and self.MIN_RESUME_PROGRESS <= float(final_completion_pct) < float(threshold)
-            ):
+                and (has_reported_scrobble or self.watch_time >= self.MIN_REPORT_WATCH_SECONDS)
+            )
+            if should_save_progress:
                 try:
                     self._report_scrobble("pause", float(final_completion_pct))
                 except Exception as e:
                     logger.warning(f"Error saving progress on stop for '{final_movie_name or final_raw_title}': {e}")
+            elif (
+                get_setting("enable_realtime_scrobble", True)
+                and has_reported_scrobble
+            ):
+                # Clear active "Now Watching" state on Simkl when stopped below MIN_RESUME_PROGRESS
+                try:
+                    pct = float(final_completion_pct) if final_completion_pct is not None else 0.0
+                    self._report_scrobble("stop", pct)
+                except Exception as e:
+                    logger.warning(f"Error stopping scrobble on close for '{final_movie_name or final_raw_title}': {e}")
 
         log_message = f"Tracking stopped for '{final_movie_name or final_raw_title}'"
         if self.completed:
