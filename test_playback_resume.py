@@ -266,3 +266,59 @@ def test_resume_skipped_for_integration_without_seek(tmp_path, monkeypatch):
 
     scrobbler._try_resume_playback("vlc.exe", position=5.0, duration=1000.0)
     assert scrobbler._resume_done is True
+
+
+def test_resume_works_with_potplayer(tmp_path, monkeypatch):
+    scrobbler = _make_scrobbler(tmp_path)
+
+    potplayer_mod = importlib.import_module("simkl_mps.players.potplayer")
+    potplayer = potplayer_mod.PotPlayerIntegration()
+
+    seek_targets = []
+    monkeypatch.setattr(potplayer, "seek_absolute", lambda sec: seek_targets.append(sec) or True)
+    monkeypatch.setattr(scrobbler, "_get_player_integration", lambda name: potplayer)
+
+    sessions = [{"id": 1, "progress": 20.0, "movie": {"ids": {"simkl": 123}}}]
+    monkeypatch.setattr(media_scrobbler_mod, "get_playback_sessions", lambda cid, tok, media_type=None: sessions)
+
+    scrobbler._try_resume_playback("potplayer.exe", position=2.0, duration=1000.0)
+    assert scrobbler._resume_done is True
+    assert seek_targets == [200.0]
+    assert scrobbler.current_position_seconds == 200.0
+
+
+def test_potplayer_is_paused_and_seek_absolute(monkeypatch):
+    potplayer_mod = importlib.import_module("simkl_mps.players.potplayer")
+    potplayer = potplayer_mod.PotPlayerIntegration()
+
+    sent_messages = []
+    def fake_send(hwnd, msg, wparam, lparam):
+        sent_messages.append((hwnd, msg, wparam, lparam))
+        if wparam == potplayer_mod.PPM_GET_PLAYBACK_STATUS:
+            return fake_send.play_status
+        return 0
+
+    fake_send.play_status = 2  # Running/Playing
+
+    monkeypatch.setattr(potplayer_mod, "win32gui", types.SimpleNamespace(SendMessage=fake_send))
+    monkeypatch.setattr(potplayer_mod, "win32con", types.SimpleNamespace(WM_USER=0x0400))
+    monkeypatch.setattr(potplayer_mod, "find_potplayer_hwnd", lambda: 12345)
+    potplayer.platform = "windows"
+
+    # Status 2 = playing -> is_paused() should be False
+    assert potplayer.is_paused() is False
+    assert sent_messages[-1] == (12345, 0x0400, potplayer_mod.PPM_GET_PLAYBACK_STATUS, 0)
+    assert potplayer_mod.PPM_GET_PLAYBACK_STATUS == 0x5006  # Must be 0x5006, not 0x5001 (which was POT_SET_VOLUME/mute)!
+
+    # Status 1 = paused -> is_paused() should be True
+    fake_send.play_status = 1
+    assert potplayer.is_paused() is True
+
+    # Status -1 = stopped -> is_paused() should be True
+    fake_send.play_status = -1
+    assert potplayer.is_paused() is True
+
+    # seek_absolute should send PPM_SET_PLAYBACK_TIME_MS (0x5005) with ms
+    ok = potplayer.seek_absolute(42.5)
+    assert ok is True
+    assert sent_messages[-1] == (12345, 0x0400, potplayer_mod.PPM_SET_PLAYBACK_TIME_MS, 42500)
