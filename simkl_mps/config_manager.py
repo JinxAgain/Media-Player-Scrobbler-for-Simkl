@@ -41,6 +41,9 @@ DEFAULT_SETTINGS = {
     "auto_sync_interval": 120,  # Auto sync backlog every 2 minutes by default
     "disable_notifications": False,  # Show all notifications by default
     "allow_rewatch": False,
+    "enable_realtime_scrobble": True,
+    "enable_playback_resume": True,
+    "resume_start_tolerance_seconds": 30,
     "allow_dirs": [],
     "deny_dirs": []
 }
