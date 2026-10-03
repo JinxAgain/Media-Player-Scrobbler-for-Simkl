@@ -24,7 +24,10 @@ from simkl_mps.simkl_api import (
     get_show_details,
     search_file,
     add_to_history,
-    search_movie
+    search_movie,
+    scrobble,
+    get_playback_sessions,
+    delete_playback
 )
 from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.window_detection import parse_movie_title, parse_filename_from_path, is_video_player
@@ -56,6 +59,9 @@ class MediaScrobbler:
     
     # Class constants
     MAX_BACKLOG_ATTEMPTS = 5  # Maximum retry attempts for backlog items
+    SCROBBLE_MIN_INTERVAL = 2.5
+    MIN_REPORT_WATCH_SECONDS = 30
+    MIN_RESUME_PROGRESS = 2.0
 
     def __init__(self, app_data_dir, client_id=None, access_token=None, testing_mode=False):
         self.app_data_dir = pathlib.Path(app_data_dir) # Ensure it's a Path object
@@ -63,6 +69,10 @@ class MediaScrobbler:
         self.access_token = access_token
         self.testing_mode = testing_mode
         self.currently_tracking = None
+        self._scrobble_reported_state = None
+        self._last_scrobble_attempt = 0.0
+        self._resume_done = False
+        self._resume_sessions = None
         self.track_start_time = None
         self.notification_callback = None
         self._processing_backlog_items = set() # Tracks items currently being processed by process_backlog
@@ -616,6 +626,10 @@ class MediaScrobbler:
         self.current_position_seconds = 0
         self.total_duration_seconds = None # Will be updated by player or API
         self.estimated_duration = None
+        self._scrobble_reported_state = None
+        self._last_scrobble_attempt = 0.0
+        self._resume_done = False
+        self._resume_sessions = None
 
         # Reset Simkl-specific details for the new item
         self.simkl_id = None
@@ -886,6 +900,13 @@ class MediaScrobbler:
                 self._attempt_add_to_history() # This handles setting self.completed
             self.last_progress_check = current_time
 
+        # Attempt reverse playback resume before syncing scrobble state
+        if process_name:
+            self._try_resume_playback(process_name, self.current_position_seconds, self.total_duration_seconds)
+
+        # Synchronize realtime scrobble state (start / pause) with Simkl
+        self._sync_scrobble_state()
+
         # Determine if a scrobble update should be returned (e.g., for UI)
         # This is different from just logging progress_update.
         should_return_scrobble_data = state_changed or (current_time - self.last_scrobble_time > DEFAULT_POLL_INTERVAL)
@@ -925,16 +946,284 @@ class MediaScrobbler:
         return round(percentage, 2) if percentage is not None else None
 
 
-    def _detect_pause(self, window_info):
-        """Detect if playback is paused based on window title keywords."""
-        if window_info and window_info.get('title'):
-            title_lower = window_info['title'].lower()
-            # More robust pause detection might involve checking player status directly if available
-            # For now, relying on title keywords
-            pause_keywords = ["paused", "- pause", "[paused]"]
-            if any(keyword in title_lower for keyword in pause_keywords):
+    def _build_scrobble_item(self) -> dict | None:
+        """
+        Builds the item payload for the Simkl Scrobble API.
+        Returns None for unidentified media or temporary IDs.
+        """
+        if not self.simkl_id or str(self.simkl_id).startswith("temp_"):
+            return None
+        try:
+            item_id = int(self.simkl_id)
+        except (ValueError, TypeError):
+            return None
+
+        if self.media_type == "movie":
+            return {"movie": {"ids": {"simkl": item_id}}}
+        elif self.media_type == "show":
+            if self.season is not None and self.episode is not None:
+                return {
+                    "show": {"ids": {"simkl": item_id}},
+                    "episode": {"season": int(self.season), "number": int(self.episode)}
+                }
+            return None
+        elif self.media_type == "anime":
+            if self.episode is not None:
+                ep = {"number": int(self.episode)}
+                if self.season is not None:
+                    ep["season"] = int(self.season)
+                return {
+                    "anime": {"ids": {"simkl": item_id}},
+                    "episode": ep
+                }
+            return None
+        return None
+
+    def _current_progress_pct(self) -> float | None:
+        """Calculate current playback progress percentage."""
+        return self._calculate_percentage(use_position=True)
+
+    def _report_scrobble(self, action: str, progress: float) -> bool:
+        """
+        Reports playback state (start, pause, stop) to Simkl Scrobble API.
+        """
+        if not self.client_id or not self.access_token:
+            return False
+
+        item = self._build_scrobble_item()
+        if not item:
+            return False
+
+        self._last_scrobble_attempt = time.time()
+        try:
+            res = scrobble(action, item, progress, self.client_id, self.access_token)
+            if res.get("ok"):
+                logger.info(f"Simkl scrobble '{action}' reported at {progress:.1f}% for '{self.movie_name or self.currently_tracking}'.")
                 return True
+            else:
+                logger.warning(f"Simkl scrobble '{action}' failed (status {res.get('status')}): {res.get('error')}")
+                return False
+        except Exception as e:
+            logger.warning(f"Exception during Simkl scrobble '{action}': {e}")
+            return False
+
+    def _sync_scrobble_state(self) -> None:
+        """
+        Synchronizes playback state (start / pause) with Simkl Scrobble API.
+        Respects enable_realtime_scrobble setting and min debounce interval.
+        """
+        if not get_setting("enable_realtime_scrobble", True):
+            return
+        if not self.currently_tracking or not self.simkl_id or self.completed:
+            return
+        if str(self.simkl_id).startswith("temp_"):
+            return
+
+        desired = "pause" if self.state == PAUSED else "start"
+        if desired != self._scrobble_reported_state:
+            current_time = time.time()
+            if current_time - self._last_scrobble_attempt >= self.SCROBBLE_MIN_INTERVAL:
+                pct = self._current_progress_pct()
+                progress_val = float(pct) if pct is not None else 0.0
+                ok = self._report_scrobble(desired, progress_val)
+                if ok:
+                    self._scrobble_reported_state = desired
+
+    def _detect_pause(self, window_info):
+        """Detect if playback is paused based on player status or window title keywords."""
+        if window_info:
+            process_name = window_info.get('process_name')
+            if process_name:
+                try:
+                    integration = self._get_player_integration(process_name.lower())
+                    if integration and hasattr(integration, "is_paused"):
+                        if integration.__class__.__name__ == "MPVWrapperIntegration":
+                            paused = integration.is_paused(process_name)
+                        else:
+                            paused = integration.is_paused()
+                        if paused is not None:
+                            return bool(paused)
+                except Exception as e:
+                    logger.debug(f"Error checking is_paused on player integration: {e}")
+
+            if window_info.get('title'):
+                title_lower = window_info['title'].lower()
+                pause_keywords = ["paused", "- pause", "[paused]"]
+                if any(keyword in title_lower for keyword in pause_keywords):
+                    return True
         return False
+
+    @staticmethod
+    def _format_timestamp(seconds: float) -> str:
+        """Format seconds into M:SS or H:MM:SS."""
+        total_seconds = int(round(seconds))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes}:{secs:02d}"
+
+    def _find_matching_playback(self, sessions: list[dict]) -> dict | None:
+        """
+        Finds the matching playback session from Simkl for the currently tracked media.
+        Returns the session with the most recent paused_at timestamp.
+        """
+        if not sessions or not isinstance(sessions, list):
+            return None
+        if not self.simkl_id or str(self.simkl_id).startswith("temp_"):
+            return None
+        try:
+            target_id = int(self.simkl_id)
+        except (ValueError, TypeError):
+            return None
+
+        candidates = []
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            if self.media_type == "movie":
+                movie = session.get("movie") or (session if session.get("type") == "movie" else None)
+                if isinstance(movie, dict):
+                    ids = movie.get("ids", {})
+                    simkl_id = ids.get("simkl") or ids.get("simkl_id")
+                    if simkl_id is not None and int(simkl_id) == target_id:
+                        candidates.append(session)
+            elif self.media_type in ("show", "anime"):
+                media_obj = session.get("show") or session.get("anime")
+                ep = session.get("episode")
+                if isinstance(media_obj, dict) and isinstance(ep, dict):
+                    ids = media_obj.get("ids", {})
+                    simkl_id = ids.get("simkl") or ids.get("simkl_id")
+                    if simkl_id is not None and int(simkl_id) == target_id:
+                        ep_number = ep.get("number")
+                        if ep_number is not None and self.episode is not None and int(ep_number) == int(self.episode):
+                            if self.season is not None and ep.get("season") is not None:
+                                if int(ep.get("season")) != int(self.season):
+                                    continue
+                            candidates.append(session)
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda s: str(s.get("paused_at", "")), reverse=True)
+        return candidates[0]
+
+    def _try_resume_playback(self, process_name: str, position: float | None, duration: float | None) -> None:
+        """
+        Attempts to resume playback from Simkl's saved progress position.
+        Runs at most once per tracked media item.
+        """
+        if self._resume_done:
+            return
+
+        if not get_setting("enable_playback_resume", True):
+            self._resume_done = True
+            return
+
+        if not self.client_id or not self.access_token:
+            self._resume_done = True
+            return
+
+        if not self.simkl_id or str(self.simkl_id).startswith("temp_"):
+            return
+
+        if duration is None or duration <= 0:
+            return
+
+        if self._resume_sessions is None:
+            media_type_filter = "movies" if self.media_type == "movie" else "episodes"
+            try:
+                sessions = get_playback_sessions(self.client_id, self.access_token, media_type=media_type_filter)
+            except Exception as e:
+                logger.warning(f"Error fetching playback sessions from Simkl: {e}")
+                sessions = None
+
+            if sessions is None:
+                self._resume_done = True
+                return
+            self._resume_sessions = sessions
+
+        matching = self._find_matching_playback(self._resume_sessions)
+        self._resume_done = True
+        if not matching:
+            return
+
+        progress = float(matching.get("progress", 0.0))
+        threshold = float(self.completion_threshold) if self.completion_threshold is not None else 80.0
+        if not (self.MIN_RESUME_PROGRESS <= progress < threshold):
+            return
+
+        tolerance = float(get_setting("resume_start_tolerance_seconds", 30))
+        current_pos = float(position) if position is not None else 0.0
+        if current_pos > tolerance:
+            logger.info(f"Playback resume skipped for '{self.movie_name or self.currently_tracking}': current position {current_pos:.1f}s exceeds tolerance {tolerance:.1f}s.")
+            return
+
+        target = (progress / 100.0) * float(duration)
+        if abs(current_pos - target) <= 5.0:
+            logger.info(f"Playback resume skipped: position {current_pos:.1f}s already close to target {target:.1f}s.")
+            return
+
+        integration = self._get_player_integration(process_name.lower()) if process_name else None
+        if not integration or not hasattr(integration, "seek_absolute"):
+            return
+
+        if integration.__class__.__name__ == "MPVWrapperIntegration":
+            seek_ok = integration.seek_absolute(target, process_name)
+        else:
+            seek_ok = integration.seek_absolute(target)
+
+        if seek_ok:
+            self.current_position_seconds = target
+            osd_text = f"[Simkl] Resumed at {int(round(progress))}% ({self._format_timestamp(target)})"
+            if hasattr(integration, "show_osd"):
+                if integration.__class__.__name__ == "MPVWrapperIntegration":
+                    integration.show_osd(osd_text, 3500, process_name)
+                else:
+                    integration.show_osd(osd_text, 3500)
+
+            logger.info(f"Simkl playback resumed for '{self.movie_name or self.currently_tracking}' at {progress:.1f}% ({self._format_timestamp(target)}).")
+            self._log_playback_event("resume_applied", extra_data={
+                "playback_id": matching.get("id"),
+                "resumed_progress": progress,
+                "target_seconds": round(target, 2),
+                "previous_position_seconds": round(current_pos, 2)
+            })
+
+    def _clear_saved_playback(self) -> None:
+        """
+        Removes any saved/paused playback session for the completed item from Simkl.
+        Only acts if a pause was reported or a resume was applied during tracking.
+        Swallows all errors so completion is never interrupted.
+        """
+        if self._scrobble_reported_state != "pause" and self._resume_sessions is None:
+            return
+
+        if not self.client_id or not self.access_token:
+            return
+
+        if not self.simkl_id or str(self.simkl_id).startswith("temp_"):
+            return
+
+        try:
+            sessions = self._resume_sessions
+            if sessions is None:
+                media_type_filter = "movies" if self.media_type == "movie" else "episodes"
+                sessions = get_playback_sessions(self.client_id, self.access_token, media_type=media_type_filter)
+
+            if not sessions:
+                return
+
+            matching = self._find_matching_playback(sessions)
+            if matching and matching.get("id"):
+                playback_id = matching["id"]
+                deleted = delete_playback(playback_id, self.client_id, self.access_token)
+                if deleted:
+                    logger.info(f"Deleted Simkl playback session {playback_id} for completed item '{self.movie_name or self.currently_tracking}'.")
+        except Exception as e:
+            logger.debug(f"Failed to clear saved playback from Simkl: {e}")
 
     def stop_tracking(self):
         """Stop tracking the current media item and reset state."""
@@ -962,6 +1251,17 @@ class MediaScrobbler:
                 logger.info(f"'{final_movie_name or final_raw_title}' met completion threshold upon stopping.")
                 # Attempt to add to history if not already done
                 self._attempt_add_to_history() # This might set self.completed
+            elif (
+                get_setting("enable_realtime_scrobble", True)
+                and self.watch_time >= self.MIN_REPORT_WATCH_SECONDS
+                and final_completion_pct is not None
+                and threshold is not None
+                and self.MIN_RESUME_PROGRESS <= float(final_completion_pct) < float(threshold)
+            ):
+                try:
+                    self._report_scrobble("pause", float(final_completion_pct))
+                except Exception as e:
+                    logger.warning(f"Error saving progress on stop for '{final_movie_name or final_raw_title}': {e}")
 
         log_message = f"Tracking stopped for '{final_movie_name or final_raw_title}'"
         if self.completed:
@@ -991,6 +1291,10 @@ class MediaScrobbler:
         self.media_type = None
         self.season = None
         self.episode = None
+        self._scrobble_reported_state = None
+        self._last_scrobble_attempt = 0.0
+        self._resume_done = False
+        self._resume_sessions = None
         # self.last_backlog_attempt_time should persist for items, not cleared globally here.        
         return {
             "raw_title": final_raw_title,
@@ -1657,6 +1961,7 @@ class MediaScrobbler:
             result = add_to_history(payload, self.client_id, self.access_token, allow_rewatch=allow_rewatch)
             if result:
                 self.completed = True
+                self._clear_saved_playback()
                 self._log_playback_event("added_to_history_success", {"simkl_id": self.simkl_id, "type": self.media_type})
                 self._store_in_watch_history(
                     self.simkl_id, self.currently_tracking, self.movie_name, # Raw, Official
