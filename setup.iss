@@ -4,7 +4,7 @@
 #define MyAppURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl"
 #define MyAppExeName "MPSS"
 #define MyAppTrayName "MPS for Simkl"
-#define MyAppVersion "2.4.1"
+#define MyAppVersion "2.5.0"
 #define MyAppDescription "Automatically track and scrobble media you watch to SIMKL"
 #define MyAppCopyright "Copyright (C) 2025 kavin"
 #define MyAppUpdateURL "https://github.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/releases"
@@ -85,7 +85,7 @@ Source: "dist\MPSS.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
 ; Tray executable
 Source: "dist\MPS for Simkl.exe"; DestDir: "{app}"; Flags: ignoreversion signonce
 ; All other files (DLLs, data, etc.)
-Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "installer,installer\*"
 ; Include updater script directly
 Source: "simkl_mps\utils\updater.ps1"; DestDir: "{app}"; Flags: ignoreversion
 ; Create version file to help with About dialog
