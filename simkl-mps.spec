@@ -134,6 +134,7 @@ hidden_imports = [
     'win32api', 'win32con', 'win32gui',
     'tkinter', 'tkinter.ttk',  # Add tkinter for dialogs
     'threading',  # Ensure threading is included
+    'pypresence',
 ]
 
 # Main application analysis

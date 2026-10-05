@@ -7,6 +7,7 @@ Access Token is loaded from a .env file in the user's application data directory
 import pathlib
 import logging
 import os
+import sys
 from dotenv import dotenv_values
 from .migration import get_app_data_dir, perform_full_migration
 

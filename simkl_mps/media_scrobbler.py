@@ -32,6 +32,7 @@ from simkl_mps.simkl_api import (
 from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.window_detection import parse_movie_title, parse_filename_from_path, is_video_player
 from simkl_mps.media_cache import MediaCache
+from simkl_mps.discord_rpc import DiscordRPCManager
 
 logger = logging.getLogger(__name__)
 try:
@@ -145,6 +146,10 @@ class MediaScrobbler:
         self._account_settings_all = None # Cached /sync/activities settings timestamp
         self._last_account_settings_check = 0
         self._menu_refresh_callback = None
+        self.discord_rpc = DiscordRPCManager(client_id=get_setting("discord_client_id", "1556713709462880316"))
+        self._discord_reported_state = None
+        self.poster_url = None
+        self.year = None
 
     def _refresh_dir_filters(self, min_interval_seconds=60):
         """Refresh directory allow/deny lists periodically to avoid frequent disk I/O."""
@@ -778,6 +783,18 @@ class MediaScrobbler:
 
         self._derive_display_season_episode()
         
+        raw_poster = cached_info.get("poster_url") or cached_info.get("poster")
+        if raw_poster:
+            if raw_poster.startswith("http://") or raw_poster.startswith("https://"):
+                self.poster_url = raw_poster
+            else:
+                self.poster_url = f"https://simkl.net/posters/{raw_poster}_m.jpg"
+        if cached_info.get("year"):
+            try:
+                self.year = int(cached_info.get("year"))
+            except (ValueError, TypeError):
+                pass
+
         if 'duration_seconds' in cached_info and self.total_duration_seconds is None:
             self.total_duration_seconds = cached_info['duration_seconds']
             self.estimated_duration = self.total_duration_seconds
@@ -907,6 +924,9 @@ class MediaScrobbler:
         # Synchronize realtime scrobble state (start / pause) with Simkl
         self._sync_scrobble_state()
 
+        # Synchronize Discord Rich Presence
+        self._sync_discord_presence()
+
         # Determine if a scrobble update should be returned (e.g., for UI)
         # This is different from just logging progress_update.
         should_return_scrobble_data = state_changed or (current_time - self.last_scrobble_time > DEFAULT_POLL_INTERVAL)
@@ -1028,6 +1048,79 @@ class MediaScrobbler:
                 ok = self._report_scrobble(desired, progress_val)
                 if ok:
                     self._scrobble_reported_state = desired
+
+    def _sync_discord_presence(self) -> None:
+        """
+        Synchronizes media playback state to Discord Rich Presence.
+        """
+        if not hasattr(self, "discord_rpc") or self.discord_rpc is None:
+            return
+
+        if not get_setting("enable_discord_rpc", True):
+            if self._discord_reported_state != "cleared":
+                self.discord_rpc.clear_presence()
+                self._discord_reported_state = "cleared"
+            return
+
+        if self.state == STOPPED or not self.movie_name:
+            if self._discord_reported_state != "cleared":
+                self.discord_rpc.clear_presence()
+                self._discord_reported_state = "cleared"
+            return
+
+        # Resolve poster URL and year from state or media_cache
+        poster_url = getattr(self, "poster_url", None)
+        year = getattr(self, "year", None)
+
+        if (not poster_url or not year) and hasattr(self, "media_cache") and self.media_cache:
+            cached_item = None
+            if self.simkl_id:
+                _, cached_item = self.media_cache.get_by_simkl_id(self.simkl_id)
+            if not cached_item and self.current_filepath:
+                cached_item = self.media_cache.get(os.path.basename(self.current_filepath))
+            if not cached_item and self.currently_tracking:
+                cached_item = self.media_cache.get(self.currently_tracking)
+            if not cached_item and self.movie_name:
+                cached_item = self.media_cache.get(self.movie_name)
+            if not cached_item and hasattr(self.media_cache, "cache"):
+                for key in [self.movie_name, self.currently_tracking, self.current_filepath]:
+                    if key and key in self.media_cache.cache:
+                        cached_item = self.media_cache.cache[key]
+                        break
+
+            if cached_item:
+                if not poster_url:
+                    raw_poster = cached_item.get("poster_url") or cached_item.get("poster")
+                    if raw_poster:
+                        if raw_poster.startswith("http://") or raw_poster.startswith("https://"):
+                            poster_url = raw_poster
+                        else:
+                            poster_url = f"https://simkl.net/posters/{raw_poster}_m.jpg"
+                        self.poster_url = poster_url
+                if not year:
+                    raw_year = cached_item.get("year")
+                    if raw_year:
+                        try:
+                            year = int(raw_year)
+                            self.year = year
+                        except (ValueError, TypeError):
+                            pass
+
+        is_paused = (self.state == PAUSED)
+        self.discord_rpc.update_presence(
+            title=self.movie_name,
+            year=year,
+            media_type=self.media_type or "movie",
+            season=self.display_season or self.season,
+            episode=self.display_episode or self.episode,
+            episode_title=getattr(self, "episode_title", None),
+            current_position=self.current_position_seconds,
+            total_duration=self.total_duration_seconds or self.estimated_duration,
+            poster_url=poster_url,
+            simkl_id=self.simkl_id,
+            is_paused=is_paused
+        )
+        self._discord_reported_state = "paused" if is_paused else "playing"
 
     def _detect_pause(self, window_info):
         """Detect if playback is paused based on player status or window title keywords."""
@@ -1286,6 +1379,13 @@ class MediaScrobbler:
             "final_watch_time_seconds": round(final_watch_time, 2)
         })
 
+        if hasattr(self, "discord_rpc") and self.discord_rpc:
+            try:
+                self.discord_rpc.clear_presence()
+                self._discord_reported_state = "cleared"
+            except Exception as e:
+                logger.debug(f"Error clearing Discord presence on stop: {e}")
+
         # Reset all tracking variables
         self.currently_tracking = None
         self.start_time = None
@@ -1303,6 +1403,8 @@ class MediaScrobbler:
         self.media_type = None
         self.season = None
         self.episode = None
+        self.poster_url = None
+        self.year = None
         self._scrobble_reported_state = None
         self._last_scrobble_attempt = 0.0
         self._resume_done = False
@@ -2896,6 +2998,16 @@ class MediaScrobbler:
             if episode is not None: self.episode = episode
             if season_display is not None: self.display_season = season_display
             if episode_display is not None: self.display_episode = episode_display
+            if poster_url_for_cache:
+                if str(poster_url_for_cache).startswith("http://") or str(poster_url_for_cache).startswith("https://"):
+                    self.poster_url = str(poster_url_for_cache)
+                else:
+                    self.poster_url = f"https://simkl.net/posters/{poster_url_for_cache}_m.jpg"
+            if year is not None:
+                try:
+                    self.year = int(year)
+                except (ValueError, TypeError):
+                    pass
 
             self._derive_display_season_episode()
             
@@ -3112,3 +3224,11 @@ class MediaScrobbler:
             return "Enable IPC socket in mpv.conf of your player. Check documentation for details."
         
         return "Please check if web interface/IPC is enabled in your player settings."
+
+    def close(self):
+        """Clean up resources on application shutdown."""
+        if hasattr(self, "discord_rpc") and self.discord_rpc:
+            try:
+                self.discord_rpc.close()
+            except Exception:
+                pass
