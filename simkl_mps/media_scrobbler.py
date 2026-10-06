@@ -41,7 +41,7 @@ except ImportError:
     guessit = None
 
 from simkl_mps.utils.constants import PLAYING, PAUSED, STOPPED, DEFAULT_POLL_INTERVAL
-from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD
+from simkl_mps.config_manager import get_setting, DEFAULT_THRESHOLD, DEFAULT_MIN_REWATCH_WATCH_SECONDS
 from simkl_mps.watch_history_manager import WatchHistoryManager
 from simkl_mps.utils.path_filter import is_path_allowed
 
@@ -71,6 +71,8 @@ class MediaScrobbler:
         self.currently_tracking = None
         self._scrobble_reported_state = None
         self._last_scrobble_attempt = 0.0
+        self._pending_scrobble_seek = False
+        self._last_reported_progress = None
         self._resume_done = False
         self._resume_sessions = None
         self.track_start_time = None
@@ -628,6 +630,8 @@ class MediaScrobbler:
         self.estimated_duration = None
         self._scrobble_reported_state = None
         self._last_scrobble_attempt = 0.0
+        self._pending_scrobble_seek = False
+        self._last_reported_progress = None
         self._resume_done = False
         self._resume_sessions = None
 
@@ -840,8 +844,8 @@ class MediaScrobbler:
                 self.total_duration_seconds = dur
                 self.estimated_duration = dur
             # Detect seeks
-            if self.state == PLAYING and self.current_position_seconds is not None:
-                expected_pos_increase = elapsed_since_last_update
+            if self.current_position_seconds is not None:
+                expected_pos_increase = elapsed_since_last_update if self.state == PLAYING else 0.0
                 actual_pos_increase = pos - self.current_position_seconds
                 seek_threshold = 2.0
                 min_seek_display = 0.5
@@ -849,6 +853,7 @@ class MediaScrobbler:
                 if abs(actual_pos_increase - expected_pos_increase) > seek_threshold and abs(actual_pos_increase) > min_seek_display and elapsed_since_last_update > 0.1:
                     logger.info(f"Seek detected for '{self.movie_name or self.currently_tracking}': Position changed by {actual_pos_increase:.1f}s in {elapsed_since_last_update:.1f}s (Expected ~{expected_pos_increase:.1f}s).")
                     self._log_playback_event("seek", {"previous_position_seconds": round(self.current_position_seconds, 2), "new_position_seconds": pos})
+                    self._notify_seek()
             self.current_position_seconds = pos
             position_updated_from_player = True
         
@@ -891,13 +896,7 @@ class MediaScrobbler:
             self._log_playback_event("progress_update") # Generic progress event
             # self.last_scrobble_time = current_time # Update this only when returning scrobble data below        # Check completion threshold
         if not self.completed and (current_time - self.last_progress_check > 5): # Check every 5s
-            completion_pct = self._calculate_percentage(use_position=position_updated_from_player)
-            threshold = self.completion_threshold
-            if completion_pct is not None and threshold is not None and float(completion_pct) >= float(threshold):
-                display_title_for_log = self.movie_name or self.currently_tracking
-                logger.info(f"Completion threshold ({self.completion_threshold}%) met for '{display_title_for_log}' at {completion_pct:.2f}%.")
-                self._log_playback_event("completion_threshold_reached")
-                self._attempt_add_to_history() # This handles setting self.completed
+            self._check_completion_threshold(use_position=position_updated_from_player)
             self.last_progress_check = current_time
 
         # Attempt reverse playback resume before syncing scrobble state
@@ -1007,6 +1006,41 @@ class MediaScrobbler:
             logger.warning(f"Exception during Simkl scrobble '{action}': {e}")
             return False
 
+    def _notify_seek(self) -> None:
+        """Mark that a seek event occurred and needs synchronization to Simkl."""
+        self._pending_scrobble_seek = True
+
+    def _check_completion_threshold(self, use_position: bool = True) -> bool:
+        """
+        Checks whether playback completion threshold has been met.
+        Enforces minimum watch time to avoid false triggers
+        when opening a finished file via player resume/history or skipping to the end.
+        """
+        if self.completed:
+            return False
+
+        completion_pct = self._calculate_percentage(use_position=use_position)
+        threshold = self.completion_threshold
+        if completion_pct is not None and threshold is not None and float(completion_pct) >= float(threshold):
+            display_title = self.movie_name or self.currently_tracking
+            configured_min_time = get_setting("min_rewatch_watch_seconds", DEFAULT_MIN_REWATCH_WATCH_SECONDS)
+            min_watch_time = configured_min_time
+            if self.total_duration_seconds and self.total_duration_seconds > 0:
+                duration_threshold_time = self.total_duration_seconds * (float(threshold) / 100.0)
+                min_watch_time = min(configured_min_time, duration_threshold_time)
+
+            if self.watch_time < min_watch_time:
+                logger.debug(
+                    f"Completion threshold ({threshold}%) met for '{display_title}' at {completion_pct:.2f}%, "
+                    f"but history sync deferred: watch time ({self.watch_time:.1f}s) < required threshold ({min_watch_time:.1f}s)."
+                )
+                return False
+
+            logger.info(f"Completion threshold ({self.completion_threshold}%) met for '{display_title}' at {completion_pct:.2f}%.")
+            self._log_playback_event("completion_threshold_reached")
+            return bool(self._attempt_add_to_history())
+        return False
+
     def _sync_scrobble_state(self) -> None:
         """
         Synchronizes playback state (start / pause) with Simkl Scrobble API.
@@ -1014,13 +1048,18 @@ class MediaScrobbler:
         """
         if not get_setting("enable_realtime_scrobble", True):
             return
-        if not self.currently_tracking or not self.simkl_id or self.completed:
+        if not self.currently_tracking or not self.simkl_id:
             return
         if str(self.simkl_id).startswith("temp_"):
             return
+        if self.completed and self._scrobble_reported_state is None:
+            return
 
         desired = "pause" if self.state == PAUSED else "start"
-        if desired != self._scrobble_reported_state:
+        state_changed = (desired != self._scrobble_reported_state)
+        needs_report = state_changed or self._pending_scrobble_seek
+
+        if needs_report:
             current_time = time.time()
             if current_time - self._last_scrobble_attempt >= self.SCROBBLE_MIN_INTERVAL:
                 pct = self._current_progress_pct()
@@ -1028,6 +1067,8 @@ class MediaScrobbler:
                 ok = self._report_scrobble(desired, progress_val)
                 if ok:
                     self._scrobble_reported_state = desired
+                    self._last_reported_progress = progress_val
+                    self._pending_scrobble_seek = False
 
     def _detect_pause(self, window_info):
         """Detect if playback is paused based on player status or window title keywords."""
@@ -1192,13 +1233,14 @@ class MediaScrobbler:
                 "previous_position_seconds": round(current_pos, 2)
             })
 
-    def _clear_saved_playback(self) -> None:
+    def _clear_saved_playback(self, force_refresh: bool = False) -> None:
         """
         Removes any saved/paused playback session for the completed item from Simkl.
-        Only acts if a pause was reported or a resume was applied during tracking.
+        Only acts if a pause was reported or a resume was applied during tracking,
+        unless force_refresh=True (e.g. when stopped near 0% to clear active session).
         Swallows all errors so completion is never interrupted.
         """
-        if self._scrobble_reported_state != "pause" and self._resume_sessions is None:
+        if not force_refresh and self._scrobble_reported_state != "pause" and self._resume_sessions is None:
             return
 
         if not self.client_id or not self.access_token:
@@ -1208,7 +1250,7 @@ class MediaScrobbler:
             return
 
         try:
-            sessions = self._resume_sessions
+            sessions = None if force_refresh else self._resume_sessions
             if sessions is None:
                 media_type_filter = "movies" if self.media_type == "movie" else "episodes"
                 sessions = get_playback_sessions(self.client_id, self.access_token, media_type=media_type_filter)
@@ -1245,15 +1287,15 @@ class MediaScrobbler:
         # Check completion one last time before stopping
         # Use a stricter check if it wasn't already marked complete by _update_tracking
         if not self.completed:
-            final_completion_pct = self._calculate_percentage(use_position=True) # Prefer position at stop
-            threshold = self.completion_threshold
-            if final_completion_pct is not None and threshold is not None and float(final_completion_pct) >= float(threshold):
-                logger.info(f"'{final_movie_name or final_raw_title}' met completion threshold upon stopping.")
-                # Attempt to add to history if not already done
-                self._attempt_add_to_history() # This might set self.completed
-            has_reported_scrobble = (self._scrobble_reported_state is not None)
+            self._check_completion_threshold(use_position=True)
+
+        final_completion_pct = self._calculate_percentage(use_position=True) # Prefer position at stop
+        threshold = self.completion_threshold
+        has_reported_scrobble = (self._scrobble_reported_state is not None)
+
+        if get_setting("enable_realtime_scrobble", True):
             should_save_progress = (
-                get_setting("enable_realtime_scrobble", True)
+                not self.completed
                 and final_completion_pct is not None
                 and threshold is not None
                 and self.MIN_RESUME_PROGRESS <= float(final_completion_pct) < float(threshold)
@@ -1264,16 +1306,20 @@ class MediaScrobbler:
                     self._report_scrobble("pause", float(final_completion_pct))
                 except Exception as e:
                     logger.warning(f"Error saving progress on stop for '{final_movie_name or final_raw_title}': {e}")
-            elif (
-                get_setting("enable_realtime_scrobble", True)
-                and has_reported_scrobble
-            ):
-                # Clear active "Now Watching" state on Simkl when stopped below MIN_RESUME_PROGRESS
+            elif has_reported_scrobble:
+                # Playback has ended and we are not saving an unfinished resume point
+                # (e.g. completed item, or stopped below MIN_RESUME_PROGRESS, or watch time < MIN_REPORT_WATCH_SECONDS).
+                # Terminate active "Now Watching" session on Simkl and delete any residual playback session.
                 try:
-                    pct = float(final_completion_pct) if final_completion_pct is not None else 0.0
+                    pct = float(final_completion_pct) if final_completion_pct is not None else (100.0 if self.completed else 0.0)
                     self._report_scrobble("stop", pct)
                 except Exception as e:
                     logger.warning(f"Error stopping scrobble on close for '{final_movie_name or final_raw_title}': {e}")
+                self._clear_saved_playback(force_refresh=True)
+            elif self.completed:
+                self._clear_saved_playback(force_refresh=True)
+        elif self.completed:
+            self._clear_saved_playback(force_refresh=True)
 
         log_message = f"Tracking stopped for '{final_movie_name or final_raw_title}'"
         if self.completed:
@@ -1305,6 +1351,8 @@ class MediaScrobbler:
         self.episode = None
         self._scrobble_reported_state = None
         self._last_scrobble_attempt = 0.0
+        self._pending_scrobble_seek = False
+        self._last_reported_progress = None
         self._resume_done = False
         self._resume_sessions = None
         # self.last_backlog_attempt_time should persist for items, not cleared globally here.        
@@ -1961,7 +2009,22 @@ class MediaScrobbler:
             log_item_desc += f" S{self.season}E{self.episode}" if self.media_type == 'show' and self.season else f" E{self.episode}"
 
         try:
-            # Only allow rewatch if user is Pro/VIP
+            # Enforce minimum watch time before syncing to history (applies to both first watch and rewatch)
+            configured_min_time = get_setting("min_rewatch_watch_seconds", DEFAULT_MIN_REWATCH_WATCH_SECONDS)
+            threshold = self.completion_threshold or 80.0
+            min_watch_time = configured_min_time
+            if self.total_duration_seconds and self.total_duration_seconds > 0:
+                duration_threshold_time = self.total_duration_seconds * (float(threshold) / 100.0)
+                min_watch_time = min(configured_min_time, duration_threshold_time)
+
+            if self.watch_time < min_watch_time:
+                logger.info(
+                    f"Skipping history sync for '{display_title}': watch time "
+                    f"({self.watch_time:.1f}s) < required threshold ({min_watch_time:.1f}s)."
+                )
+                return False
+
+            # Only allow rewatch if user is Pro/VIP and allow_rewatch setting is enabled
             allow_rewatch = False
             if self.is_pro_or_vip():
                 allow_rewatch = get_setting('allow_rewatch', True)
