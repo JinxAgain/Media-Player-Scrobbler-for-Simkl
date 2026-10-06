@@ -131,3 +131,47 @@ def test_media_scrobbler_resolves_poster_via_simkl_id_lookup(mock_rpc_cls, tmp_p
     assert kwargs["poster_url"] == "https://simkl.net/posters/13/13667609b5f759c72f_m.jpg"
     assert kwargs["year"] == 2018
 
+
+@patch("simkl_mps.media_scrobbler.DiscordRPCManager")
+def test_stop_tracking_clears_discord_even_without_currently_tracking(mock_rpc_cls, tmp_path):
+    mock_rpc = MagicMock()
+    mock_rpc_cls.return_value = mock_rpc
+
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    scrobbler.currently_tracking = None
+    scrobbler._discord_reported_state = "playing"
+
+    scrobbler.stop_tracking()
+    assert mock_rpc.clear_presence.called
+    assert scrobbler._discord_reported_state == "cleared"
+
+
+@patch("simkl_mps.media_scrobbler.DiscordRPCManager")
+def test_stop_tracking_clears_discord_when_tracking(mock_rpc_cls, tmp_path):
+    mock_rpc = MagicMock()
+    mock_rpc_cls.return_value = mock_rpc
+
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    scrobbler.currently_tracking = "Succession"
+    scrobbler.movie_name = "Succession"
+    scrobbler.state = PLAYING
+    scrobbler._discord_reported_state = "playing"
+
+    scrobbler.stop_tracking()
+    assert mock_rpc.clear_presence.called
+    assert scrobbler._discord_reported_state == "cleared"
+
+
+def test_monitor_stop_clears_discord_presence(tmp_path):
+    from simkl_mps.monitor import Monitor
+    monitor = Monitor(app_data_dir=tmp_path)
+    mock_rpc = MagicMock()
+    monitor.scrobbler.discord_rpc = mock_rpc
+    monitor.scrobbler._discord_reported_state = "playing"
+
+    monitor.stop()
+    assert mock_rpc.clear_presence.called
+    assert monitor.scrobbler._discord_reported_state == "cleared"
+
+
+

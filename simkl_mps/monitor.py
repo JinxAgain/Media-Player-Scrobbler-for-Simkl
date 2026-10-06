@@ -70,10 +70,7 @@ class Monitor:
 
     def stop(self):
         """Stop monitoring"""
-        if not self.running:
-            logger.warning("Monitor not running")
-            return False
-
+        was_running = self.running
         self.running = False
         
         if self.monitor_thread and self.monitor_thread.is_alive():
@@ -85,7 +82,14 @@ class Monitor:
         with self._lock:
             if self.scrobbler.currently_tracking:
                 self.scrobbler.stop_tracking()
+            elif hasattr(self.scrobbler, "discord_rpc") and self.scrobbler.discord_rpc:
+                self.scrobbler.discord_rpc.clear_presence()
+                self.scrobbler._discord_reported_state = "cleared"
         
+        if not was_running:
+            logger.debug("Monitor was not running during stop, cleanup performed.")
+            return False
+
         logger.info("Monitor stopped")
         return True
 
@@ -165,13 +169,25 @@ class Monitor:
                     with self._lock:
                         if self.scrobbler.currently_tracking: # Ensure we only stop if tracking
                             self.scrobbler.stop_tracking()
+                        else:
+                            if hasattr(self.scrobbler, "discord_rpc") and self.scrobbler.discord_rpc:
+                                self.scrobbler.discord_rpc.clear_presence()
+                            self.scrobbler._discord_reported_state = "cleared"
                         last_processed_titles.clear()  # Clear the processed titles when stopping
                     # Reset persistent state as no player is active now
                     self.last_known_player_process = None
                     self.last_known_filepath = None
-                elif not found_player and self._debug_cycles % 10 == 0:
-                    # Periodically log if we're not finding any players
-                    logger.debug(f"No video players detected (cycle {self._debug_cycles})")
+                elif not found_player:
+                    # Reconciliation: if no player is active anywhere on system, ensure DRP is not left lingering
+                    if getattr(self.scrobbler, "_discord_reported_state", None) not in (None, "cleared"):
+                        logger.info("No active player detected while Discord presence was active. Clearing Discord Rich Presence.")
+                        with self._lock:
+                            if hasattr(self.scrobbler, "discord_rpc") and self.scrobbler.discord_rpc:
+                                self.scrobbler.discord_rpc.clear_presence()
+                            self.scrobbler._discord_reported_state = "cleared"
+                    if self._debug_cycles % 10 == 0:
+                        # Periodically log if we're not finding any players
+                        logger.debug(f"No video players detected (cycle {self._debug_cycles})")
 
                 # Check backlog periodically
                 current_time = time.time()

@@ -33,6 +33,7 @@ class DiscordRPCManager:
         self.is_connected: bool = False
         self._last_update_time: float = 0.0
         self._last_connect_attempt: float = 0.0
+        self._last_failed_connect_attempt: float = 0.0
         self._connect_cooldown_seconds: float = 30.0
         self._update_debounce_seconds: float = 1.5
         self._last_payload: Optional[Dict[str, Any]] = None
@@ -46,21 +47,23 @@ class DiscordRPCManager:
             return False
 
         now = time.time()
-        if now - self._last_connect_attempt < self._connect_cooldown_seconds:
-            return False
         self._last_connect_attempt = now
+        if now - self._last_failed_connect_attempt < self._connect_cooldown_seconds:
+            return False
 
         try:
             if not self._presence:
                 self._presence = Presence(self.client_id)
             self._presence.connect()
             self.is_connected = True
+            self._last_failed_connect_attempt = 0.0
             logger.info("Connected to Discord Rich Presence IPC.")
             return True
         except Exception as e:
             logger.debug("Could not connect to Discord RPC (is Discord running?): %s", e)
             self.is_connected = False
             self._presence = None
+            self._last_failed_connect_attempt = now
             return False
 
     def _build_payload(
@@ -226,32 +229,37 @@ class DiscordRPCManager:
 
     def clear_presence(self) -> bool:
         """
-        Clears the Discord Rich Presence activity.
+        Clears the Discord Rich Presence activity and disconnects the IPC pipe.
+        Closing the connection ensures Discord unconditionally drops presence
+        from the user profile and prevents lingering presence state.
         """
-        if not self.is_connected or not self._presence:
+        self._last_payload = None
+        if not self._presence:
+            self.is_connected = False
             return True
 
+        cleared = False
         try:
             self._presence.clear()
-            self._last_payload = None
-            logger.debug("Cleared Discord Rich Presence.")
-            return True
+            cleared = True
         except Exception as e:
-            logger.debug("Failed to clear Discord RPC: %s", e)
-            self.is_connected = False
-            self._presence = None
-            return False
+            logger.warning("Failed to clear Discord RPC activity: %s", e)
+
+        try:
+            self._presence.close()
+        except Exception as e:
+            logger.debug("Failed to close Discord RPC connection: %s", e)
+
+        self._presence = None
+        self.is_connected = False
+        self._last_failed_connect_attempt = 0.0
+
+        if cleared:
+            logger.info("Cleared Discord Rich Presence.")
+        return True
 
     def close(self) -> None:
         """
         Gracefully disconnects and closes the Discord RPC client.
         """
-        if self._presence:
-            try:
-                self._presence.clear()
-                self._presence.close()
-            except Exception:
-                pass
-            finally:
-                self._presence = None
-                self.is_connected = False
+        self.clear_presence()

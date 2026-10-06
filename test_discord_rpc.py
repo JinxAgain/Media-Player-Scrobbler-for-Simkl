@@ -125,6 +125,9 @@ def test_clear_presence():
 
     assert mgr.clear_presence() is True
     assert mock_presence.clear.called
+    assert mock_presence.close.called
+    assert mgr.is_connected is False
+    assert mgr._presence is None
 
 def test_update_presence_passes_watching_and_timestamps():
     from pypresence import ActivityType

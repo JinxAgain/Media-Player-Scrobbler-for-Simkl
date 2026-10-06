@@ -1363,6 +1363,12 @@ class MediaScrobbler:
     def stop_tracking(self):
         """Stop tracking the current media item and reset state."""
         if not self.currently_tracking:
+            if hasattr(self, "discord_rpc") and self.discord_rpc:
+                try:
+                    self.discord_rpc.clear_presence()
+                except Exception as e:
+                    logger.debug(f"Error clearing Discord presence on stop: {e}")
+                self._discord_reported_state = "cleared"
             return None
 
         final_raw_title = self.currently_tracking
@@ -1430,7 +1436,7 @@ class MediaScrobbler:
                 self.discord_rpc.clear_presence()
                 self._discord_reported_state = "cleared"
             except Exception as e:
-                logger.debug(f"Error clearing Discord presence on stop: {e}")
+                logger.warning(f"Error clearing Discord presence on stop: {e}")
 
         # Reset all tracking variables
         self.currently_tracking = None
