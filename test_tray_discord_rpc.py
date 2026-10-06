@@ -20,6 +20,7 @@ class FakeTrayApp(TrayAppBase):
         self.notifications_shown.append((title, message))
 
     def _ask_custom_threshold_dialog(self, current_threshold): pass
+    def _ask_custom_min_watch_time_dialog(self, current_seconds): pass
     def _ask_directory_filter_dialog(self, title, current_dirs): pass
     def exit_app(self, _=None): pass
     def run(self): pass
