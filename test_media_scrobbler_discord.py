@@ -174,4 +174,84 @@ def test_monitor_stop_clears_discord_presence(tmp_path):
     assert monitor.scrobbler._discord_reported_state == "cleared"
 
 
+@patch("simkl_mps.media_scrobbler.DiscordRPCManager")
+def test_media_scrobbler_syncs_discord_with_episode_title(mock_rpc_cls, tmp_path):
+    mock_rpc = MagicMock()
+    mock_rpc_cls.return_value = mock_rpc
+
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    scrobbler.movie_name = "Succession"
+    scrobbler.media_type = "show"
+    scrobbler.season = 2
+    scrobbler.episode = 4
+    scrobbler.display_season = 2
+    scrobbler.display_episode = 4
+    scrobbler.episode_title = "Safe Room"
+    scrobbler.simkl_id = 739608
+    scrobbler.state = PLAYING
+    scrobbler.current_position_seconds = 200
+    scrobbler.total_duration_seconds = 3600
+
+    scrobbler._sync_discord_presence()
+    assert mock_rpc.update_presence.called
+    kwargs = mock_rpc.update_presence.call_args[1]
+    assert kwargs["title"] == "Succession"
+    assert kwargs["season"] == 2
+    assert kwargs["episode"] == 4
+    assert kwargs["episode_title"] == "Safe Room"
+
+
+@patch("simkl_mps.media_scrobbler.DiscordRPCManager")
+def test_media_scrobbler_resolves_episode_title_from_media_cache(mock_rpc_cls, tmp_path):
+    mock_rpc = MagicMock()
+    mock_rpc_cls.return_value = mock_rpc
+
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    scrobbler.movie_name = "Succession"
+    scrobbler.media_type = "show"
+    scrobbler.simkl_id = 739608
+    scrobbler.episode_title = None
+    scrobbler.state = PLAYING
+    scrobbler.current_filepath = "V:/TV/Succession.S02E04.Safe.Room.mkv"
+
+    scrobbler.media_cache.set("succession.s02e04.safe.room.mkv", {
+        "simkl_id": 739608,
+        "movie_name": "Succession",
+        "episode_title": "Safe Room",
+        "year": 2018
+    })
+
+    scrobbler._sync_discord_presence()
+    assert mock_rpc.update_presence.called
+    kwargs = mock_rpc.update_presence.call_args[1]
+    assert kwargs["episode_title"] == "Safe Room"
+    assert scrobbler.episode_title == "Safe Room"
+
+
+def test_stop_tracking_resets_episode_title(tmp_path):
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    scrobbler.episode_title = "Safe Room"
+    scrobbler.stop_tracking()
+    assert scrobbler.episode_title is None
+
+
+def test_start_new_media_item_extracts_episode_title_from_guessit(tmp_path):
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    guessit_info = {
+        "title": "Succession",
+        "season": 2,
+        "episode": 4,
+        "episode_title": "Safe Room"
+    }
+    scrobbler._start_new_media_item(
+        raw_title="Succession.S02E04.Safe.Room.1080p.mkv",
+        filepath="V:/TV/Succession.S02E04.Safe.Room.1080p.mkv",
+        initial_media_type_guess="show",
+        guessit_info=guessit_info
+    )
+    assert scrobbler.episode_title == "Safe Room"
+
+
+
+
 
