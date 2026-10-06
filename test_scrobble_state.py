@@ -290,7 +290,7 @@ def test_stop_custom_threshold_90_at_85_reports_pause(tmp_path, clock_and_record
 def test_stop_at_threshold_uses_history_not_pause(tmp_path, clock_and_recorder, monkeypatch):
     _, calls = clock_and_recorder
     scrobbler = _make_scrobbler(tmp_path)
-    scrobbler.watch_time = 100.0
+    scrobbler.watch_time = 200.0
     scrobbler.completion_threshold = 65.0
     scrobbler.total_duration_seconds = 1000.0
     scrobbler.current_position_seconds = 650.0
@@ -397,6 +397,7 @@ def test_stop_network_error_does_not_raise(tmp_path, monkeypatch):
 def test_completion_deletes_matching_saved_playback(tmp_path, monkeypatch):
     scrobbler = _make_scrobbler(tmp_path)
     scrobbler._scrobble_reported_state = "pause"
+    scrobbler.watch_time = 200.0
 
     deleted_ids = []
     sessions = [{"id": 42, "movie": {"ids": {"simkl": 123}}}]
@@ -417,6 +418,7 @@ def test_completion_without_prior_pause_makes_no_calls(tmp_path, monkeypatch):
     scrobbler = _make_scrobbler(tmp_path)
     scrobbler._scrobble_reported_state = "start"
     scrobbler._resume_sessions = None
+    scrobbler.watch_time = 200.0
 
     deleted_ids = []
     monkeypatch.setattr(media_scrobbler_mod, "delete_playback", lambda pid, cid, tok: deleted_ids.append(pid) or True)
