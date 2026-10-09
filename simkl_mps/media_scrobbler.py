@@ -32,6 +32,7 @@ from simkl_mps.simkl_api import (
 from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.window_detection import parse_movie_title, parse_filename_from_path, is_video_player
 from simkl_mps.media_cache import MediaCache
+from simkl_mps.custom_mapping_manager import CustomMappingManager
 from simkl_mps.discord_rpc import DiscordRPCManager
 
 logger = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class MediaScrobbler:
         self.movie_name = None # Official title from Simkl (movie title or show title)
         self.last_scrobble_time = 0
         self.media_cache = MediaCache(app_data_dir=self.app_data_dir)
+        self.custom_mappings = CustomMappingManager(app_data_dir=self.app_data_dir)
         self.last_progress_check = 0
         self.completion_threshold = get_setting('watch_completion_threshold', DEFAULT_THRESHOLD)
         self.completed = False
@@ -115,6 +117,8 @@ class MediaScrobbler:
         self._last_connection_error_log = {} # Tracks last log time for player connection errors
         self._backlog_notification_throttle = {} # Track last notification time per item {item_key: timestamp}
         self._general_notification_throttle = {} # Track last notification time for general notifications {key: timestamp}
+        self._failed_identification_attempts = {} # Track failed search attempts to debounce polling {cache_key: timestamp}
+        self.IDENTIFICATION_RETRY_COOLDOWN = 300.0 # 5 minutes cooldown before re-searching an unidentified item
 
         self.playback_log_file = self.app_data_dir / 'playback_log.jsonl'
         self.playback_logger = logging.getLogger('PlaybackLogger')
@@ -668,25 +672,36 @@ class MediaScrobbler:
 
         # Attempt initial identification
         cache_key = os.path.basename(filepath).lower() if filepath else raw_title.lower()
-        cached_info = self.media_cache.get(cache_key)
 
-        if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
-            logger.info(f"Found cached Simkl info for '{raw_title}': ID {cached_info['simkl_id']}")
-            self._apply_cached_info_to_state(cached_info)
-        elif is_internet_connected():
-            if initial_media_type_guess == 'episode' and filepath:
-                logger.info(f"Attempting Simkl file search for episode: '{raw_title}' from '{filepath}'")
-                self._identify_media_from_filepath(filepath, guessit_info)
-            elif initial_media_type_guess == 'movie':
-                logger.info(f"Attempting Simkl movie title search for: '{raw_title}'")
-                self._identify_movie(raw_title) # Pass raw_title for movie search
-            # If neither, it will be attempted in _update_tracking if still unidentified
-        else: # Offline
-            logger.info(f"Offline: Media identification deferred for '{raw_title}'. Will use guessit/filename info if available.")
-            if filepath: # Only cache if we have a filepath
-                self._cache_initial_offline_info(raw_title, filepath, initial_media_type_guess, guessit_info)
-            else:
-                logger.info("Offline: Cannot cache basic info - filepath not available.")
+        # Priority 0: Custom mappings ALWAYS take precedence over media_cache
+        custom_match = None
+        if hasattr(self, "custom_mappings") and self.custom_mappings:
+            custom_match = self.custom_mappings.resolve(filepath, raw_title=raw_title, guessit_info=guessit_info)
+
+        if custom_match:
+            logger.info(f"Using custom mapping for '{raw_title}' (file '{cache_key}'): ID {custom_match.get('simkl_id')}")
+            custom_match['movie_name'] = custom_match.get('title')
+            self.media_cache.set(cache_key, custom_match)
+            self._apply_cached_info_to_state(custom_match)
+        else:
+            cached_info = self.media_cache.get(cache_key)
+            if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
+                logger.info(f"Found cached Simkl info for '{raw_title}': ID {cached_info['simkl_id']}")
+                self._apply_cached_info_to_state(cached_info)
+            elif is_internet_connected():
+                if initial_media_type_guess == 'episode' and filepath:
+                    logger.info(f"Attempting Simkl file search for episode: '{raw_title}' from '{filepath}'")
+                    self._identify_media_from_filepath(filepath, guessit_info)
+                elif initial_media_type_guess == 'movie':
+                    logger.info(f"Attempting Simkl movie title search for: '{raw_title}'")
+                    self._identify_movie(raw_title) # Pass raw_title for movie search
+                # If neither, it will be attempted in _update_tracking if still unidentified
+            else: # Offline
+                logger.info(f"Offline: Media identification deferred for '{raw_title}'. Will use guessit/filename info if available.")
+                if filepath: # Only cache if we have a filepath
+                    self._cache_initial_offline_info(raw_title, filepath, initial_media_type_guess, guessit_info)
+                else:
+                    logger.info("Offline: Cannot cache basic info - filepath not available.")
 
 
     def _derive_display_season_episode(self):
@@ -830,6 +845,193 @@ class MediaScrobbler:
                 online_only=True # Notifications for confirmed IDs are online-only
             )
 
+    def apply_manual_correction(
+        self,
+        simkl_id: int,
+        media_type: str,
+        title: str,
+        season: int | None = None,
+        episode: int | None = None,
+        apply_to_series: bool = False,
+        year: int | None = None,
+        poster_url: str | None = None
+    ) -> bool:
+        """
+        Manually correct the identification of the currently playing or tracked media.
+        Persists mapping rules, cleans up invalid active scrobble sessions, updates state and caches,
+        refreshes Discord RPC, and restarts scrobble reporting.
+        """
+        # Normalize poster URL
+        if poster_url and isinstance(poster_url, str):
+            poster_url = poster_url.strip()
+            if poster_url and not poster_url.startswith("http://") and not poster_url.startswith("https://"):
+                poster_url = f"https://simkl.net/posters/{poster_url}_m.jpg"
+
+        # If poster_url is missing and client credentials are available, fetch show/movie details
+        if not poster_url and self.client_id:
+            try:
+                from simkl_mps import simkl_api
+                if media_type in ('show', 'anime'):
+                    details = simkl_api.get_show_details(simkl_id, self.client_id, self.access_token)
+                else:
+                    details = simkl_api.get_movie_details(simkl_id, self.client_id, self.access_token)
+                if details:
+                    raw_p = details.get("poster_url") or details.get("poster")
+                    if raw_p and isinstance(raw_p, str):
+                        raw_p = raw_p.strip()
+                        if raw_p and not raw_p.startswith("http://") and not raw_p.startswith("https://"):
+                            poster_url = f"https://simkl.net/posters/{raw_p}_m.jpg"
+                        elif raw_p:
+                            poster_url = raw_p
+            except Exception as e:
+                logger.debug(f"Could not fetch extra details for poster in manual correction: {e}")
+
+        logger.info(f"Applying manual correction: Simkl ID {simkl_id}, Title '{title}', Type '{media_type}', S{season}E{episode}, SeriesRule={apply_to_series}")
+
+        target_path = self.current_filepath or self.currently_tracking
+        if not target_path and not title:
+            logger.warning("Cannot apply manual correction without target file or title.")
+            return False
+
+        if self.current_filepath:
+            self._failed_identification_attempts.pop(os.path.basename(self.current_filepath).lower(), None)
+        if self.currently_tracking:
+            self._failed_identification_attempts.pop(self.currently_tracking.lower(), None)
+
+        prev_simkl_id = self.simkl_id
+
+        # 1. Persist rules in custom_mappings
+        if hasattr(self, "custom_mappings") and self.custom_mappings:
+            if target_path:
+                self.custom_mappings.add_exact_mapping(
+                    filename_or_path=target_path,
+                    simkl_id=simkl_id,
+                    media_type=media_type,
+                    title=title,
+                    season=season,
+                    episode=episode,
+                    poster_url=poster_url,
+                    year=year
+                )
+            if apply_to_series and media_type in ('show', 'anime'):
+                series_key = None
+                folder_kw = None
+                if target_path:
+                    try:
+                        parent_dir = os.path.basename(os.path.dirname(target_path))
+                        if parent_dir:
+                            folder_kw = parent_dir
+                            series_key = parent_dir
+                    except Exception:
+                        pass
+                if not series_key:
+                    series_key = title.lower().strip()
+
+                self.custom_mappings.add_show_rule(
+                    match_key=series_key,
+                    simkl_id=simkl_id,
+                    media_type=media_type,
+                    title=title,
+                    default_season=season or 1,
+                    folder_keyword=folder_kw,
+                    poster_url=poster_url
+                )
+
+                # Purge stale media_cache entries that were cached for the old show/rule
+                if hasattr(self, "media_cache") and self.media_cache and hasattr(self.media_cache, "cache"):
+                    try:
+                        keys_to_purge = []
+                        for k, val in list(self.media_cache.cache.items()):
+                            if not isinstance(val, dict):
+                                continue
+                            orig_fp = val.get("original_filepath", "")
+                            if (folder_kw and folder_kw.lower() in k.lower()) or \
+                               (folder_kw and orig_fp and folder_kw.lower() in orig_fp.lower()) or \
+                               (prev_simkl_id and val.get("simkl_id") == prev_simkl_id):
+                                keys_to_purge.append(k)
+                        for k in keys_to_purge:
+                            self.media_cache.remove(k)
+                        if keys_to_purge:
+                            logger.info(f"Purged {len(keys_to_purge)} stale media_cache entries for series rule '{series_key}'")
+                    except Exception as purge_err:
+                        logger.debug(f"Error purging stale media_cache entries: {purge_err}")
+
+        # 2. Delete wrong active playback session on Simkl if exists
+        active_playback_id = getattr(self, "_scrobble_playback_id", None)
+        if active_playback_id and self.client_id and self.access_token:
+            if prev_simkl_id != simkl_id:
+                try:
+                    from simkl_mps.simkl_api import delete_playback
+                    delete_playback(active_playback_id, self.client_id, self.access_token)
+                    logger.info(f"Deleted previous active playback session {active_playback_id} for wrong Simkl ID {prev_simkl_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete wrong playback session: {e}")
+                self._scrobble_playback_id = None
+
+        # Reset scrobbler state machine tracking
+        self._scrobble_reported_state = None
+        self._last_scrobble_attempt = 0.0
+        self.completed = False
+
+        # 3. Update current instance state
+        self.simkl_id = int(simkl_id)
+        self.movie_name = title
+        self.media_type = media_type
+        self.season = season
+        self.episode = episode
+        self.display_season = season
+        self.display_episode = episode
+        if year is not None:
+            self.year = year
+        if poster_url is not None:
+            self.poster_url = poster_url
+
+        # 4. Update media_cache
+        cache_key = os.path.basename(target_path).lower() if target_path else (self.currently_tracking or "").lower()
+        if cache_key and hasattr(self, "media_cache") and self.media_cache:
+            cache_data = {
+                "simkl_id": self.simkl_id,
+                "movie_name": self.movie_name,
+                "type": self.media_type,
+                "season": self.season,
+                "episode": self.episode,
+                "season_display": self.display_season,
+                "episode_display": self.display_episode,
+                "poster_url": getattr(self, "poster_url", None),
+                "year": getattr(self, "year", None),
+                "source": "custom_mapping",
+                "original_filepath": target_path
+            }
+            self.media_cache.set(cache_key, cache_data)
+
+        # 5. Refresh Discord RPC immediately
+        try:
+            if hasattr(self, "_sync_discord_presence"):
+                self._sync_discord_presence(force=True)
+            elif hasattr(self, "_update_discord_rpc"):
+                self._update_discord_rpc(force=True)
+        except Exception as rpc_err:
+            logger.debug(f"Failed to refresh Discord RPC on correction: {rpc_err}")
+
+        # 6. Send desktop notification
+        display_text = f"Now tracking: '{self.movie_name}'"
+        if self.media_type in ['show', 'anime']:
+            suffix = self._build_episode_display_suffix()
+            if suffix:
+                display_text += suffix
+        self._send_notification("Media Corrected", display_text)
+
+        # 7. Restart realtime scrobbling if playing
+        if getattr(self, "state", None) == PLAYING:
+            logger.info(f"Restarting scrobble start for corrected media '{self.movie_name}' (ID: {self.simkl_id})")
+            if hasattr(self, "_report_scrobble"):
+                progress = self._current_progress_pct()
+                progress_val = float(progress) if progress is not None else 0.0
+                self._report_scrobble("start", progress_val)
+
+        return True
+
+
     def _start_new_movie(self, movie_title):
         """Deprecated. Use _start_new_media_item instead."""
         # This method is essentially replaced by the richer _start_new_media_item.
@@ -901,19 +1103,35 @@ class MediaScrobbler:
             self.state = new_state
             self._log_playback_event("state_change", {"previous_state": self.previous_state})
 
-        self.last_update_time = current_time        # Attempt identification if Simkl ID is still missing
+        self.last_update_time = current_time
+        # Attempt identification if Simkl ID is still missing
         if not self.simkl_id and self.currently_tracking:
             cache_key_for_lookup = os.path.basename(self.current_filepath).lower() if self.current_filepath else self.currently_tracking.lower()
-            cached_info = self.media_cache.get(cache_key_for_lookup)
-            if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
-                logger.info(f"Found cached Simkl info for '{self.currently_tracking}' during update: ID {cached_info['simkl_id']}")
-                self._apply_cached_info_to_state(cached_info) # This updates self.simkl_id, self.movie_name etc.
-            elif is_internet_connected():
-                if self.media_type == 'episode' and self.current_filepath: # media_type is initial guessit type
-                    self._identify_media_from_filepath(self.current_filepath)
-                elif self.media_type == 'movie': # media_type is initial guessit type
-                    self._identify_movie(self.currently_tracking) # Use raw title for movie search
-                # If guessit type was neither, or identification failed, it remains unknown for now.
+            custom_match = None
+            if hasattr(self, "custom_mappings") and self.custom_mappings:
+                custom_match = self.custom_mappings.resolve(self.current_filepath, raw_title=self.currently_tracking)
+
+            if custom_match:
+                logger.info(f"Using custom mapping for '{self.currently_tracking}' during update: ID {custom_match.get('simkl_id')}")
+                custom_match['movie_name'] = custom_match.get('title')
+                self.media_cache.set(cache_key_for_lookup, custom_match)
+                self._apply_cached_info_to_state(custom_match)
+            else:
+                cached_info = self.media_cache.get(cache_key_for_lookup)
+                if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
+                    logger.info(f"Found cached Simkl info for '{self.currently_tracking}' during update: ID {cached_info['simkl_id']}")
+                    self._apply_cached_info_to_state(cached_info) # This updates self.simkl_id, self.movie_name etc.
+                elif is_internet_connected():
+                    last_failed = max(
+                        self._failed_identification_attempts.get(cache_key_for_lookup, 0),
+                        self._failed_identification_attempts.get(self.currently_tracking.lower(), 0) if self.currently_tracking else 0
+                    )
+                    if current_time - last_failed > self.IDENTIFICATION_RETRY_COOLDOWN:
+                        if self.media_type == 'episode' and self.current_filepath: # media_type is initial guessit type
+                            self._identify_media_from_filepath(self.current_filepath)
+                        elif self.media_type == 'movie': # media_type is initial guessit type
+                            self._identify_movie(self.currently_tracking) # Use raw title for movie search
+                    # If identification was recently attempted and failed, debounce to avoid spamming Simkl API.
             # If identification was successful, self.simkl_id etc. are now set.
 
         # Log progress periodically or on significant changes
@@ -1099,7 +1317,7 @@ class MediaScrobbler:
                     self._last_reported_progress = progress_val
                     self._pending_scrobble_seek = False
 
-    def _sync_discord_presence(self) -> None:
+    def _sync_discord_presence(self, force: bool = False) -> None:
         """
         Synchronizes media playback state to Discord Rich Presence.
         """
@@ -1120,6 +1338,12 @@ class MediaScrobbler:
 
         # Resolve poster URL, year, and episode title from state or media_cache
         poster_url = getattr(self, "poster_url", None)
+        if poster_url and isinstance(poster_url, str):
+            poster_url = poster_url.strip()
+            if poster_url and not poster_url.startswith("http://") and not poster_url.startswith("https://"):
+                poster_url = f"https://simkl.net/posters/{poster_url}_m.jpg"
+                self.poster_url = poster_url
+
         year = getattr(self, "year", None)
         episode_title = getattr(self, "episode_title", None)
 
@@ -1172,9 +1396,13 @@ class MediaScrobbler:
             total_duration=self.total_duration_seconds or self.estimated_duration,
             poster_url=poster_url,
             simkl_id=self.simkl_id,
-            is_paused=is_paused
+            is_paused=is_paused,
+            force=force
         )
         self._discord_reported_state = "paused" if is_paused else "playing"
+
+    # Backward-compatible alias
+    _update_discord_rpc = _sync_discord_presence
 
     def _detect_pause(self, window_info):
         """Detect if playback is paused based on player status or window title keywords."""
@@ -1527,12 +1755,23 @@ class MediaScrobbler:
         Handles offline fallback using guessit with retry mechanism.
         """
         max_retries = 3
-        
+
+        cache_key = os.path.basename(filepath).lower()
+
+        # Priority 0: Check custom mappings first
+        if hasattr(self, "custom_mappings") and self.custom_mappings:
+            custom_match = self.custom_mappings.resolve(filepath, guessit_info=guessit_info)
+            if custom_match:
+                logger.info(f"Using custom mapping for file '{cache_key}': ID {custom_match.get('simkl_id')}")
+                custom_match['movie_name'] = custom_match.get('title')
+                self.media_cache.set(cache_key, custom_match)
+                self._apply_cached_info_to_state(custom_match)
+                return
+
         if not self.client_id:
             logger.warning("Cannot identify media from filepath: Missing Client ID.")
             return
 
-        cache_key = os.path.basename(filepath).lower()
         cached_info = self.media_cache.get(cache_key)
 
         if cached_info and cached_info.get('simkl_id') and not str(cached_info.get('simkl_id')).startswith("temp_"):
@@ -1616,6 +1855,15 @@ class MediaScrobbler:
                 else:
                     logger.info(f"Simkl /search/file found no match for '{filepath}'. Storing guessit fallback if available.")
                     self._store_guessit_fallback_data(filepath, guessit_info, cache_key)
+                    now = time.time()
+                    self._failed_identification_attempts[cache_key] = now
+                    self._failed_identification_attempts[os.path.basename(filepath).lower()] = now
+                    self._send_throttled_notification(
+                        f"unidentified_{cache_key}",
+                        "Simkl Media Unidentified",
+                        f"No Simkl match found for '{os.path.basename(filepath)}'. Use tray menu to manually correct matching.",
+                        throttle_minutes=30
+                    )
 
         except RequestException as e:
             logger.warning(f"Network error during Simkl file identification for '{filepath}': {e}")
@@ -1884,6 +2132,17 @@ class MediaScrobbler:
         Identifies a movie using Simkl /search/movie.
         `title_to_search` is the raw title detected from filename or window.
         """
+        # Priority 0: Check custom mappings first
+        if hasattr(self, "custom_mappings") and self.custom_mappings:
+            custom_match = self.custom_mappings.resolve(self.current_filepath, raw_title=title_to_search)
+            if custom_match:
+                logger.info(f"Using custom mapping for movie '{title_to_search}': ID {custom_match.get('simkl_id')}")
+                custom_match['movie_name'] = custom_match.get('title')
+                cache_key = title_to_search.lower()
+                self.media_cache.set(cache_key, custom_match)
+                self._apply_cached_info_to_state(custom_match)
+                return
+
         if not self.client_id or not self.access_token:
             logger.warning("Cannot identify movie by title: Missing Client ID or Access Token.")
             return
@@ -1935,6 +2194,16 @@ class MediaScrobbler:
                 self._process_simkl_search_result(results, title_to_search, cache_key, "simkl_search_movie")
             else:
                 logger.warning(f"Simkl movie search for '{title_to_search}' returned no results.")
+                now = time.time()
+                self._failed_identification_attempts[cache_key] = now
+                if self.current_filepath:
+                    self._failed_identification_attempts[os.path.basename(self.current_filepath).lower()] = now
+                self._send_throttled_notification(
+                    f"unidentified_{cache_key}",
+                    "Simkl Media Unidentified",
+                    f"No Simkl match found for '{title_to_search}'. Use tray menu to manually correct matching.",
+                    throttle_minutes=30
+                )
         except RequestException as e:
             logger.warning(f"Network error during Simkl movie search for '{title_to_search}': {e}")
         except Exception as e:

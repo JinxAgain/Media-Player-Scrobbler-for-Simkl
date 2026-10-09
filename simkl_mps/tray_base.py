@@ -1432,6 +1432,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             pystray.MenuItem('Custom...', self.set_custom_min_watch_time)
         )
         menu_items.append(pystray.MenuItem("Scrobbling", pystray.Menu(
+            pystray.MenuItem("Correct Current Media...", self.correct_current_media),
             pystray.MenuItem("Retry Last Scrobble", self.try_scrobble_again),
             pystray.MenuItem("Sync Backlog Now", self.process_backlog),
             pystray.MenuItem("Completion Threshold", threshold_submenu),
@@ -1483,6 +1484,7 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
         menu_items.append(pystray.MenuItem("Maintenance", pystray.Menu(
             pystray.MenuItem("Open Logs", self.open_logs),
             pystray.MenuItem("Open Data Folder", self.open_config_dir),
+            pystray.MenuItem("Open Custom Mappings", self.open_custom_mappings),
             pystray.MenuItem("Directory Filters", pystray.Menu(
                 pystray.MenuItem("Edit Allow List", self.set_allow_dirs),
                 pystray.MenuItem("Edit Deny List", self.set_deny_dirs),
@@ -1856,3 +1858,54 @@ class TrayAppBase(abc.ABC): # Inherit from ABC for abstract methods
             self.show_notification("simkl-mps Error", f"Failed to re-identify media: {e}")
         
         return 0
+
+    def correct_current_media(self, _=None):
+        """Open the manual correction dialog for the currently tracking media."""
+        logger.info("Manual media correction requested from tray menu...")
+        media_scrobbler = self._get_media_scrobbler()
+        if not media_scrobbler:
+            self.show_notification("simkl-mps", "No active media player or tracking session found.")
+            return 0
+
+        has_media = bool(
+            getattr(media_scrobbler, "current_filepath", None) or
+            getattr(media_scrobbler, "currently_tracking", None) or
+            getattr(media_scrobbler, "movie_name", None)
+        )
+        if not has_media:
+            self.show_notification("simkl-mps", "No active media playback found to correct. Please play a video first.")
+            return 0
+
+        self._show_correction_dialog(media_scrobbler)
+        return 0
+
+    def _show_correction_dialog(self, media_scrobbler: Any) -> None:
+        """Platform-specific implementation of the correction dialog. Override in platform subclass."""
+        logger.warning("_show_correction_dialog not implemented on this platform base class.")
+
+    def open_custom_mappings(self, _=None):
+        """Open the custom_mappings.json file in default editor or file manager."""
+        logger.info("Open custom mappings file requested from tray menu...")
+        try:
+            from simkl_mps.custom_mapping_manager import CustomMappingManager
+            cm = CustomMappingManager(APP_DATA_DIR)
+            file_path = cm.file_path
+            if not file_path.exists():
+                cm._save()
+            self._open_file_in_editor(file_path)
+        except Exception as e:
+            logger.error(f"Error opening custom mappings file: {e}")
+            self.show_notification("simkl-mps Error", f"Failed to open custom mappings: {e}")
+        return 0
+
+    def _open_file_in_editor(self, file_path: Path) -> None:
+        """Open file using platform default."""
+        try:
+            if sys.platform == 'win32':
+                os.startfile(str(file_path))
+            else:
+                import webbrowser
+                webbrowser.open(file_path.as_uri())
+        except Exception as e:
+            logger.error(f"Failed to open file {file_path}: {e}")
+

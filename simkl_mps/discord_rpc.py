@@ -132,7 +132,10 @@ class DiscordRPCManager:
 
         # 4. Large Image & Large Text
         if poster_url:
-            payload["large_image"] = poster_url
+            norm_poster = str(poster_url).strip()
+            if not norm_poster.startswith("http://") and not norm_poster.startswith("https://"):
+                norm_poster = f"https://simkl.net/posters/{norm_poster}_m.jpg"
+            payload["large_image"] = norm_poster
             payload["large_text"] = title[:128]
         else:
             payload["large_image"] = SIMKL_ICON_URL
@@ -169,7 +172,8 @@ class DiscordRPCManager:
         total_duration: Optional[float] = None,
         poster_url: Optional[str] = None,
         simkl_id: Optional[Any] = None,
-        is_paused: bool = False
+        is_paused: bool = False,
+        force: bool = False
     ) -> bool:
         """
         Updates Discord Rich Presence with current media playback state.
@@ -179,7 +183,7 @@ class DiscordRPCManager:
                 return False
 
         now = time.time()
-        if now - self._last_update_time < self._update_debounce_seconds:
+        if not force and now - self._last_update_time < self._update_debounce_seconds:
             return False
 
         payload = self._build_payload(

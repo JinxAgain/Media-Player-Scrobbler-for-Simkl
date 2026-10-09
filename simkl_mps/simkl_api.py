@@ -5,6 +5,7 @@ Provides functions for searching movies, marking them as watched,
 retrieving details, and handling the OAuth device authentication flow.
 """
 import requests
+import re
 import time
 import logging
 import socket
@@ -1027,3 +1028,119 @@ def _validate_access_token(client_id, access_token):
         return response.status_code == 200
     except:
         return False
+
+def parse_simkl_url(url: str | None) -> tuple[str, int] | None:
+    """
+    Parse a Simkl web URL to extract media type and Simkl ID.
+    Supports formats like:
+      https://simkl.com/anime/2095944/sousou-no-frieren
+      https://simkl.com/tv/1690042/shogun
+      https://simkl.com/movies/12345/dune
+      https://simkl.com/movie/12345/dune
+      simkl.com/anime/2095944
+    Returns (media_type, simkl_id) or None.
+    media_type is normalized to 'anime', 'show' (for tv), or 'movie'.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    match = re.search(r'(?:https?://)?(?:www\.)?simkl\.com/(anime|tv|movies|movie)/(\d+)', url, re.IGNORECASE)
+    if not match:
+        return None
+    category = match.group(1).lower()
+    simkl_id = int(match.group(2))
+    if category == 'tv':
+        media_type = 'show'
+    elif category in ('movies', 'movie'):
+        media_type = 'movie'
+    else:
+        media_type = 'anime'
+    return media_type, simkl_id
+
+def search_simkl_multi(query: str, client_id: str, access_token: str | None = None, limit_per_category: int = 5) -> list[dict]:
+    """
+    Search Simkl across multiple categories (anime, tv shows, movies).
+    Returns a unified list of search results.
+    """
+    if not query or not client_id:
+        return []
+
+    headers = {
+        'Content-Type': 'application/json',
+        'simkl-api-key': client_id,
+    }
+    if access_token:
+        headers['Authorization'] = f'Bearer {access_token}'
+    headers = _add_user_agent(headers)
+
+    params = {
+        'q': query.strip(),
+        'extended': 'full',
+        'client_id': client_id,
+        'app-name': APP_NAME,
+        'app-version': __version__
+    }
+
+    results = []
+    seen_ids = set()
+
+    endpoints = [
+        ('/search/anime', 'anime'),
+        ('/search/tv', 'show'),
+        ('/search/movie', 'movie'),
+    ]
+
+    for endpoint, default_type in endpoints:
+        try:
+            url = f"{SIMKL_API_BASE_URL}{endpoint}"
+            resp = requests.get(url, headers=headers, params=params, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    count = 0
+                    for item in data:
+                        if count >= limit_per_category:
+                            break
+                        media_obj = item.get('movie') or item.get('show') or item.get('anime') or item
+                        ids = media_obj.get('ids', {}) if isinstance(media_obj, dict) else {}
+                        simkl_id = ids.get('simkl') or ids.get('simkl_id') or media_obj.get('simkl_id')
+                        if not simkl_id:
+                            continue
+                        try:
+                            simkl_id = int(simkl_id)
+                        except (ValueError, TypeError):
+                            pass
+                        if simkl_id in seen_ids:
+                            continue
+                        seen_ids.add(simkl_id)
+
+                        item_type = media_obj.get('type') or default_type
+                        if item_type == 'tv':
+                            item_type = 'show'
+
+                        poster = None
+                        if 'poster' in media_obj:
+                            poster = media_obj['poster']
+                        elif 'poster_url' in media_obj:
+                            poster = media_obj['poster_url']
+                        elif 'images' in media_obj and isinstance(media_obj['images'], dict):
+                            poster = media_obj['images'].get('poster')
+
+                        if poster and isinstance(poster, str):
+                            poster = poster.strip()
+                            if poster and not poster.startswith("http://") and not poster.startswith("https://"):
+                                poster = f"https://simkl.net/posters/{poster}_m.jpg"
+
+                        results.append({
+                            "simkl_id": simkl_id,
+                            "type": item_type,
+                            "title": media_obj.get('title', 'Unknown'),
+                            "year": media_obj.get('year'),
+                            "poster_url": poster,
+                            "overview": media_obj.get('overview')
+                        })
+                        count += 1
+        except Exception as e:
+            logger.warning(f"Error querying Simkl endpoint {endpoint} for '{query}': {e}")
+
+    return results
