@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DONATION_URL = "https://github.com/sponsors/itskavin"
 # Hardcoded application version (used by About dialog).
-APP_HARDCODED_VERSION = "2.5.5"
+APP_HARDCODED_VERSION = "2.6.0"
 
 def get_simkl_scrobbler():
     """Lazy import for SimklScrobbler to avoid circular imports"""

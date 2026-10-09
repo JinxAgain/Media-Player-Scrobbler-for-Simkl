@@ -4,6 +4,11 @@ from simkl_mps.media_scrobbler import MediaScrobbler
 from simkl_mps.utils.constants import PLAYING, PAUSED, STOPPED
 
 
+@pytest.fixture(autouse=True)
+def mock_network_offline(monkeypatch):
+    monkeypatch.setattr("simkl_mps.media_scrobbler.is_internet_connected", lambda: False)
+
+
 @patch("simkl_mps.media_scrobbler.DiscordRPCManager")
 def test_media_scrobbler_syncs_discord_on_playing(mock_rpc_cls, tmp_path):
     mock_rpc = MagicMock()
