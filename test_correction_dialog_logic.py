@@ -87,7 +87,10 @@ def test_show_correction_window_viewable_with_withdrawn_parent():
     from unittest.mock import MagicMock
     from simkl_mps.correction_dialog import show_correction_window
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        pytest.skip(f"Tkinter not available or failed to initialize: {e}")
     root.withdraw()
 
     mock_scrobbler = MagicMock()
@@ -110,7 +113,10 @@ def test_show_correction_window_ui_english():
     from unittest.mock import MagicMock
     from simkl_mps.correction_dialog import show_correction_window
 
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except Exception as e:
+        pytest.skip(f"Tkinter not available or failed to reinitialize: {e}")
     root.withdraw()
 
     mock_scrobbler = MagicMock()

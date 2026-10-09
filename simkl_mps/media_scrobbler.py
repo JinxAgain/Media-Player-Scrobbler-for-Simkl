@@ -2091,6 +2091,8 @@ class MediaScrobbler:
         original_filepath_for_cache = None
         if isinstance(original_input, str) and (os.path.sep in original_input or (os.path.altsep and os.path.altsep in original_input)):
             original_filepath_for_cache = original_input
+        elif self.current_filepath:
+            original_filepath_for_cache = self.current_filepath
 
         self.cache_media_info(
             original_title_key=cache_key,
@@ -2192,6 +2194,9 @@ class MediaScrobbler:
                 # search_movie can return a list or a single movie dict
                 # _process_simkl_search_result handles both list (takes first) and dict
                 self._process_simkl_search_result(results, title_to_search, cache_key, "simkl_search_movie")
+                self._failed_identification_attempts.pop(cache_key, None)
+                if self.current_filepath:
+                    self._failed_identification_attempts.pop(os.path.basename(self.current_filepath).lower(), None)
             else:
                 logger.warning(f"Simkl movie search for '{title_to_search}' returned no results.")
                 now = time.time()
@@ -3331,6 +3336,11 @@ class MediaScrobbler:
 
             self.media_cache.update(existing_key_for_id, merged_data)
             logger.info(f"Updated entry for Simkl ID {simkl_id} at key '{existing_key_for_id}'.")
+            if original_filepath_if_any:
+                file_cache_key = os.path.basename(original_filepath_if_any).lower()
+                if file_cache_key != existing_key_for_id:
+                    self.media_cache.set(file_cache_key, merged_data)
+                    logger.info(f"Also cached updated info under filename key '{file_cache_key}'.")
             
             # If the current call was with a different key (cache_key_to_use)
             # and that key points to a now-redundant entry (that isn't the one we just updated), remove it.
@@ -3350,6 +3360,11 @@ class MediaScrobbler:
 
             self.media_cache.set(cache_key_to_use, new_data_to_cache)
             logger.info(f"Cached new info for '{new_data_to_cache.get('movie_name', 'N/A')}' (ID: {simkl_id}) under key '{cache_key_to_use}'.")
+            if original_filepath_if_any:
+                file_cache_key = os.path.basename(original_filepath_if_any).lower()
+                if file_cache_key != cache_key_to_use:
+                    self.media_cache.set(file_cache_key, new_data_to_cache)
+                    logger.info(f"Also cached new info under filename key '{file_cache_key}'.")
 
         # If currently tracking this item, update instance state
         if self.currently_tracking and \

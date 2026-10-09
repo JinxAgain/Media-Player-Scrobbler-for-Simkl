@@ -235,7 +235,8 @@ def test_stop_tracking_resets_episode_title(tmp_path):
     assert scrobbler.episode_title is None
 
 
-def test_start_new_media_item_extracts_episode_title_from_guessit(tmp_path):
+def test_start_new_media_item_extracts_episode_title_from_guessit(tmp_path, monkeypatch):
+    monkeypatch.setattr("simkl_mps.media_scrobbler.is_internet_connected", lambda: False)
     scrobbler = MediaScrobbler(app_data_dir=tmp_path)
     guessit_info = {
         "title": "Succession",
