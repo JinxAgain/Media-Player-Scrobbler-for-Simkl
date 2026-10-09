@@ -250,6 +250,122 @@ def test_start_new_media_item_extracts_episode_title_from_guessit(tmp_path):
         guessit_info=guessit_info
     )
     assert scrobbler.episode_title == "Safe Room"
+    assert scrobbler._local_episode_title == "Safe Room"
+
+
+def test_start_new_media_item_ignores_generic_guessit_title(tmp_path):
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    guessit_info = {
+        "title": "Small Prophets",
+        "season": 1,
+        "episode": 1,
+        "episode_title": "Episode 1"
+    }
+    scrobbler._start_new_media_item(
+        raw_title="Small.Prophets.S01E01.Episode.1.1080p.mkv",
+        filepath="V:/TV/Small.Prophets.S01E01.Episode.1.1080p.mkv",
+        initial_media_type_guess="show",
+        guessit_info=guessit_info
+    )
+    assert scrobbler.episode_title is None
+    assert scrobbler._local_episode_title is None
+
+
+@patch("simkl_mps.media_scrobbler.DiscordRPCManager")
+def test_simkl_generic_title_falls_back_to_local_filename(mock_rpc_cls, tmp_path):
+    mock_rpc = MagicMock()
+    mock_rpc_cls.return_value = mock_rpc
+
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    guessit_info = {
+        "title": "Small Prophets",
+        "season": 1,
+        "episode": 1,
+        "episode_title": "The Secret"
+    }
+    scrobbler._start_new_media_item(
+        raw_title="Small.Prophets.S01E01.The.Secret.1080p.mkv",
+        filepath="V:/TV/Small.Prophets.S01E01.The.Secret.1080p.mkv",
+        initial_media_type_guess="show",
+        guessit_info=guessit_info
+    )
+
+    # Simkl search returns generic "Episode 1"
+    search_res = {
+        "show": {
+            "title": "Small Prophets",
+            "year": 2026,
+            "type": "show",
+            "ids": {"simkl": 99999}
+        },
+        "episode": {
+            "season": 1,
+            "episode": 1,
+            "title": "Episode 1"
+        }
+    }
+    scrobbler._process_simkl_search_result(
+        search_res,
+        "Small.Prophets.S01E01.The.Secret.1080p.mkv",
+        "small.prophets.s01e01.the.secret.1080p.mkv",
+        "simkl_search"
+    )
+    # Must fallback to local filename title "The Secret"
+    assert scrobbler.episode_title == "The Secret"
+
+    scrobbler._sync_discord_presence()
+    assert mock_rpc.update_presence.called
+    kwargs = mock_rpc.update_presence.call_args[1]
+    assert kwargs["episode_title"] == "The Secret"
+
+
+@patch("simkl_mps.media_scrobbler.DiscordRPCManager")
+def test_simkl_generic_title_omitted_when_no_local_title(mock_rpc_cls, tmp_path):
+    mock_rpc = MagicMock()
+    mock_rpc_cls.return_value = mock_rpc
+
+    scrobbler = MediaScrobbler(app_data_dir=tmp_path)
+    # Filename has NO episode title
+    guessit_info = {
+        "title": "Small Prophets",
+        "season": 1,
+        "episode": 1
+    }
+    scrobbler._start_new_media_item(
+        raw_title="Small.Prophets.S01E01.1080p.mkv",
+        filepath="V:/TV/Small.Prophets.S01E01.1080p.mkv",
+        initial_media_type_guess="show",
+        guessit_info=guessit_info
+    )
+
+    # Simkl search returns generic "Episode 1"
+    search_res = {
+        "show": {
+            "title": "Small Prophets",
+            "year": 2026,
+            "type": "show",
+            "ids": {"simkl": 99999}
+        },
+        "episode": {
+            "season": 1,
+            "episode": 1,
+            "title": "Episode 1"
+        }
+    }
+    scrobbler._process_simkl_search_result(
+        search_res,
+        "Small.Prophets.S01E01.1080p.mkv",
+        "small.prophets.s01e01.1080p.mkv",
+        "simkl_search"
+    )
+    # Must be None (no episode title)
+    assert scrobbler.episode_title is None
+
+    scrobbler._sync_discord_presence()
+    assert mock_rpc.update_presence.called
+    kwargs = mock_rpc.update_presence.call_args[1]
+    assert kwargs["episode_title"] is None
+
 
 
 

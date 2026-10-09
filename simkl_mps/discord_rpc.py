@@ -4,10 +4,30 @@ Synchronizes active media playback to user's Discord profile via local IPC.
 """
 
 import logging
+import re
 import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+GENERIC_EPISODE_TITLE_REGEX = re.compile(
+    r"^(?:(?:season\s*\d+[\s,]+)?(?:episode|ep\.?|e)\s*#?\s*\d+\.?|s\d+\s*e\d+|\d+|tba|tbd|n/a|unknown)$",
+    re.IGNORECASE
+)
+
+
+def is_generic_episode_title(title: Optional[str]) -> bool:
+    """
+    Checks whether an episode title is a generic placeholder (e.g. 'Episode 1', 'Ep 01', 'E1', '1').
+    Returns True if title is empty, None, or matches a generic pattern.
+    """
+    if not title:
+        return True
+    cleaned = str(title).strip()
+    if not cleaned:
+        return True
+    return bool(GENERIC_EPISODE_TITLE_REGEX.match(cleaned))
+
 
 try:
     from pypresence import Presence, ActivityType
@@ -17,6 +37,7 @@ except ImportError:
     ActivityType = None
     PYPRESENCE_AVAILABLE = False
     logger.debug("pypresence is not installed. Discord Rich Presence will be disabled.")
+
 
 DEFAULT_DISCORD_CLIENT_ID = "1556713709462880316"
 SIMKL_ICON_URL = "https://raw.githubusercontent.com/ByteTrix/Media-Player-Scrobbler-for-Simkl/master/simkl_mps/assets/simkl-mps-128.png"
@@ -89,6 +110,9 @@ class DiscordRPCManager:
             details = details[:125] + "..."
 
         # 2. State (Season/Episode / Watching / Paused)
+        if is_generic_episode_title(episode_title):
+            episode_title = None
+
         if media_type in ("show", "anime"):
             if season is not None and episode is not None:
                 ep_code = f"S{season:02d}E{episode:02d}"
