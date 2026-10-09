@@ -33,7 +33,7 @@ from simkl_mps.backlog_cleaner import BacklogCleaner
 from simkl_mps.window_detection import parse_movie_title, parse_filename_from_path, is_video_player
 from simkl_mps.media_cache import MediaCache
 from simkl_mps.custom_mapping_manager import CustomMappingManager
-from simkl_mps.discord_rpc import DiscordRPCManager
+from simkl_mps.discord_rpc import DiscordRPCManager, is_generic_episode_title
 
 logger = logging.getLogger(__name__)
 try:
@@ -157,6 +157,7 @@ class MediaScrobbler:
         self.poster_url = None
         self.year = None
         self.episode_title = None
+        self._local_episode_title = None
 
     def _refresh_dir_filters(self, min_interval_seconds=60):
         """Refresh directory allow/deny lists periodically to avoid frequent disk I/O."""
@@ -656,6 +657,7 @@ class MediaScrobbler:
         self.display_season = None
         self.display_episode = None
         self.episode_title = None
+        self._local_episode_title = None
 
         if guessit_info and isinstance(guessit_info, dict):
             self._season_guess_from_filename = guessit_info.get('season')
@@ -664,7 +666,10 @@ class MediaScrobbler:
             self.display_episode = self._episode_guess_from_filename
             raw_ep_title = guessit_info.get('episode_title')
             if raw_ep_title and isinstance(raw_ep_title, str):
-                self.episode_title = raw_ep_title.strip()
+                cleaned_ep_title = raw_ep_title.strip()
+                if not is_generic_episode_title(cleaned_ep_title):
+                    self._local_episode_title = cleaned_ep_title
+                    self.episode_title = cleaned_ep_title
 
         self._derive_display_season_episode()
 
@@ -774,8 +779,9 @@ class MediaScrobbler:
         if media_type_guess == 'episode' and guessit_info:
             initial_offline_cache_data["season"] = guessit_info.get('season')
             initial_offline_cache_data["episode"] = guessit_info.get('episode')
-            if guessit_info.get('episode_title'):
-                initial_offline_cache_data["episode_title"] = guessit_info.get('episode_title')
+            raw_ep_title = guessit_info.get('episode_title')
+            if raw_ep_title and not is_generic_episode_title(raw_ep_title):
+                initial_offline_cache_data["episode_title"] = str(raw_ep_title).strip()
 
 
         existing_entry = self.media_cache.get(offline_cache_key)
@@ -807,7 +813,15 @@ class MediaScrobbler:
         if 'episode_display' in cached_info:
             self.display_episode = cached_info.get('episode_display')
         if cached_info.get('episode_title'):
-            self.episode_title = str(cached_info['episode_title']).strip()
+            cached_ep_title = str(cached_info['episode_title']).strip()
+            if not is_generic_episode_title(cached_ep_title):
+                self.episode_title = cached_ep_title
+            elif getattr(self, "_local_episode_title", None):
+                self.episode_title = self._local_episode_title
+            else:
+                self.episode_title = None
+        elif getattr(self, "_local_episode_title", None):
+            self.episode_title = self._local_episode_title
 
         self._derive_display_season_episode()
         
@@ -1346,6 +1360,8 @@ class MediaScrobbler:
 
         year = getattr(self, "year", None)
         episode_title = getattr(self, "episode_title", None)
+        if is_generic_episode_title(episode_title):
+            episode_title = getattr(self, "_local_episode_title", None)
 
         if (not poster_url or not year or not episode_title) and hasattr(self, "media_cache") and self.media_cache:
             cached_item = None
@@ -1381,8 +1397,19 @@ class MediaScrobbler:
                         except (ValueError, TypeError):
                             pass
                 if not episode_title and cached_item.get("episode_title"):
-                    episode_title = str(cached_item["episode_title"]).strip()
-                    self.episode_title = episode_title
+                    cached_ep_title = str(cached_item["episode_title"]).strip()
+                    if not is_generic_episode_title(cached_ep_title):
+                        episode_title = cached_ep_title
+                        self.episode_title = episode_title
+                    elif getattr(self, "_local_episode_title", None):
+                        episode_title = self._local_episode_title
+                        self.episode_title = episode_title
+
+        final_discord_ep_title = episode_title or getattr(self, "episode_title", None)
+        if is_generic_episode_title(final_discord_ep_title):
+            final_discord_ep_title = getattr(self, "_local_episode_title", None)
+        if is_generic_episode_title(final_discord_ep_title):
+            final_discord_ep_title = None
 
         is_paused = (self.state == PAUSED)
         self.discord_rpc.update_presence(
@@ -1391,7 +1418,7 @@ class MediaScrobbler:
             media_type=self.media_type or "movie",
             season=self.display_season or self.season,
             episode=self.display_episode or self.episode,
-            episode_title=episode_title or getattr(self, "episode_title", None),
+            episode_title=final_discord_ep_title,
             current_position=self.current_position_seconds,
             total_duration=self.total_duration_seconds or self.estimated_duration,
             poster_url=poster_url,
@@ -1605,6 +1632,7 @@ class MediaScrobbler:
         """Stop tracking the current media item and reset state."""
         if not self.currently_tracking:
             self.episode_title = None
+            self._local_episode_title = None
             if hasattr(self, "discord_rpc") and self.discord_rpc:
                 try:
                     self.discord_rpc.clear_presence()
@@ -1700,6 +1728,7 @@ class MediaScrobbler:
         self.poster_url = None
         self.year = None
         self.episode_title = None
+        self._local_episode_title = None
         self._scrobble_reported_state = None
         self._last_scrobble_attempt = 0.0
         self._pending_scrobble_seek = False
@@ -2009,8 +2038,12 @@ class MediaScrobbler:
             if 'episode' in episode_details_from_api:
                 self.episode = episode_details_from_api['episode']
             ep_title = episode_details_from_api.get('title') or episode_details_from_api.get('name')
-            if ep_title:
+            if ep_title and not is_generic_episode_title(str(ep_title).strip()):
                 self.episode_title = str(ep_title).strip()
+            elif getattr(self, "_local_episode_title", None):
+                self.episode_title = self._local_episode_title
+            else:
+                self.episode_title = None
         
         self._derive_display_season_episode()
 
@@ -2045,6 +2078,10 @@ class MediaScrobbler:
         final_overview_for_cache = media_item.get('overview') or episode_details_from_api.get('overview')
         final_poster_url_for_cache = media_item.get('poster') or episode_details_from_api.get('poster')
         final_episode_title_for_cache = getattr(self, "episode_title", None)
+        if is_generic_episode_title(final_episode_title_for_cache):
+            final_episode_title_for_cache = getattr(self, "_local_episode_title", None)
+        if is_generic_episode_title(final_episode_title_for_cache):
+            final_episode_title_for_cache = None
         # Default _api_full_details to the media_item from search_file result
         final_api_full_details_for_cache = media_item
 
@@ -3243,8 +3280,16 @@ class MediaScrobbler:
 
                         ep_specific_title = ep_api_data.get('title') or ep_api_data.get('name')
                         if ep_specific_title and ep_specific_title.strip():
-                            episode_title_for_cache = ep_specific_title.strip()
-                            logger.info(f"Using episode-specific title: '{episode_title_for_cache}'.")
+                            cleaned_ep_title = ep_specific_title.strip()
+                            if not is_generic_episode_title(cleaned_ep_title):
+                                episode_title_for_cache = cleaned_ep_title
+                                logger.info(f"Using episode-specific title: '{episode_title_for_cache}'.")
+                            else:
+                                logger.info(f"Ignoring generic episode-specific title from API: '{cleaned_ep_title}'.")
+                                if getattr(self, "_local_episode_title", None):
+                                    episode_title_for_cache = self._local_episode_title
+                                else:
+                                    episode_title_for_cache = None
                         
                         # Poster is typically show-level, poster_url_for_cache (derived from poster_url param) is not changed here.
                         break # Found the matching episode
@@ -3273,7 +3318,10 @@ class MediaScrobbler:
             if episode is not None: new_data_to_cache["episode"] = episode
             if season_display is not None: new_data_to_cache["season_display"] = season_display
             if episode_display is not None: new_data_to_cache["episode_display"] = episode_display
-            if episode_title_for_cache: new_data_to_cache["episode_title"] = episode_title_for_cache
+            if episode_title_for_cache and not is_generic_episode_title(episode_title_for_cache):
+                new_data_to_cache["episode_title"] = episode_title_for_cache
+            else:
+                new_data_to_cache["episode_title"] = None
         
         duration_seconds_to_cache = None
         if runtime_minutes_for_cache: # Use the potentially episode-specific runtime
@@ -3328,6 +3376,12 @@ class MediaScrobbler:
                         merged_data[key] = new_value
                     else: # General overwrite for other fields if new_value is present
                         merged_data[key] = new_value
+
+            if is_generic_episode_title(merged_data.get("episode_title")):
+                if new_data_to_cache.get("episode_title") and not is_generic_episode_title(new_data_to_cache["episode_title"]):
+                    merged_data["episode_title"] = new_data_to_cache["episode_title"]
+                else:
+                    merged_data.pop("episode_title", None)
             
             # Ensure essential fields are correctly set from the latest information
             if display_name: merged_data["movie_name"] = display_name
@@ -3380,7 +3434,12 @@ class MediaScrobbler:
             if episode is not None: self.episode = episode
             if season_display is not None: self.display_season = season_display
             if episode_display is not None: self.display_episode = episode_display
-            if episode_title_for_cache: self.episode_title = episode_title_for_cache
+            if episode_title_for_cache and not is_generic_episode_title(episode_title_for_cache):
+                self.episode_title = episode_title_for_cache
+            elif getattr(self, "_local_episode_title", None):
+                self.episode_title = self._local_episode_title
+            else:
+                self.episode_title = None
             if poster_url_for_cache:
                 if str(poster_url_for_cache).startswith("http://") or str(poster_url_for_cache).startswith("https://"):
                     self.poster_url = str(poster_url_for_cache)

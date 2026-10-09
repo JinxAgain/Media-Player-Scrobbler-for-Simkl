@@ -160,3 +160,69 @@ def test_update_presence_passes_watching_and_timestamps():
     assert kwargs["buttons"][0]["label"] == "View on Simkl"
     assert kwargs["buttons"][0]["url"] == "https://simkl.com/tv/739608"
 
+
+def test_is_generic_episode_title():
+    from simkl_mps.discord_rpc import is_generic_episode_title
+    # Generic placeholders should return True
+    assert is_generic_episode_title("Episode 1") is True
+    assert is_generic_episode_title("Episode 01") is True
+    assert is_generic_episode_title("episode 12") is True
+    assert is_generic_episode_title("Ep 1") is True
+    assert is_generic_episode_title("Ep. 1") is True
+    assert is_generic_episode_title("E01") is True
+    assert is_generic_episode_title("S01E01") is True
+    assert is_generic_episode_title("Season 1 Episode 1") is True
+    assert is_generic_episode_title("1") is True
+    assert is_generic_episode_title("01") is True
+    assert is_generic_episode_title("TBA") is True
+    assert is_generic_episode_title("TBD") is True
+    assert is_generic_episode_title("") is True
+    assert is_generic_episode_title(None) is True
+
+    # Real episode titles should return False
+    assert is_generic_episode_title("Safe Room") is False
+    assert is_generic_episode_title("Cruelty") is False
+    assert is_generic_episode_title("Pilot") is False
+    assert is_generic_episode_title("Episode 1: The Beginning") is False
+    assert is_generic_episode_title("Chapter 1") is False
+
+
+def test_format_payload_tv_generic_episode_title_omitted():
+    mgr = DiscordRPCManager(client_id="1556713709462880316")
+    payload = mgr._build_payload(
+        title="Small Prophets",
+        year=2026,
+        media_type="show",
+        season=1,
+        episode=1,
+        episode_title="Episode 1",
+        current_position=100.0,
+        total_duration=1800.0,
+        poster_url=None,
+        simkl_id=99999,
+        is_paused=False
+    )
+    assert payload["details"] == "Small Prophets (2026)"
+    # Must omit "Episode 1" and show only "S01E01"
+    assert payload["state"] == "S01E01"
+
+
+def test_format_payload_anime_generic_episode_title_omitted():
+    mgr = DiscordRPCManager(client_id="1556713709462880316")
+    payload = mgr._build_payload(
+        title="Frieren",
+        year=2023,
+        media_type="anime",
+        season=None,
+        episode=1,
+        episode_title="Episode 01",
+        current_position=200.0,
+        total_duration=1400.0,
+        poster_url=None,
+        simkl_id=88888,
+        is_paused=False
+    )
+    # Must omit generic "Episode 01" and show only "EP 1"
+    assert payload["state"] == "EP 1"
+
+
