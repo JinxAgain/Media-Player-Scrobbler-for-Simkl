@@ -11,6 +11,7 @@ import logging
 import webbrowser
 import subprocess # Added for running updater script
 import queue
+from typing import Any
 from pathlib import Path
 from PIL import Image # Keep PIL.Image for loading
 from PIL import ImageTk
@@ -38,6 +39,7 @@ class TrayAppWin(TrayAppBase):
         self._tk_queue: "queue.Queue[tuple[callable, queue.Queue]] | None" = None
         self._tk_thread: threading.Thread | None = None
         self._tk_root: tk.Tk | None = None
+        self._active_correction_dialog: tk.Toplevel | None = None
         self._setup_auto_update_if_needed() # Run platform-specific setup
         self._init_tk_thread()
         self.setup_icon()
@@ -527,6 +529,41 @@ Tips:
     # stop_monitoring is now in base class
     # process_backlog is now in base class
     # open_logs is now in base class
+
+    def _show_correction_dialog(self, media_scrobbler: Any) -> None:
+        """Windows implementation to open the manual correction dialog on Tk thread."""
+        def _dialog():
+            if getattr(self, "_active_correction_dialog", None):
+                try:
+                    if self._active_correction_dialog.winfo_exists():
+                        self._active_correction_dialog.deiconify()
+                        self._active_correction_dialog.attributes("-topmost", True)
+                        self._active_correction_dialog.lift()
+                        self._active_correction_dialog.focus_force()
+                        return
+                except Exception as e:
+                    logger.debug(f"Error restoring active correction dialog: {e}")
+                    self._active_correction_dialog = None
+
+            parent = self._tk_root
+            from simkl_mps.correction_dialog import show_correction_window
+            win = show_correction_window(
+                parent_root=parent,
+                scrobbler=media_scrobbler,
+                on_success_callback=lambda: self.update_icon()
+            )
+            self._active_correction_dialog = win
+
+            def _on_destroy(event):
+                if event.widget == win:
+                    self._active_correction_dialog = None
+
+            try:
+                win.bind("<Destroy>", _on_destroy)
+            except Exception:
+                pass
+
+        self._run_on_tk_thread(_dialog)
 
     # --- Watch Threshold Implementation ---
 

@@ -5,11 +5,13 @@ Provides functions for searching movies, marking them as watched,
 retrieving details, and handling the OAuth device authentication flow.
 """
 import requests
+import re
 import time
 import logging
 import socket
 import platform
 import sys
+import os
 try:
     from simkl_mps import __version__
 except ImportError:
@@ -83,6 +85,52 @@ def _normalize_simkl_ids(item_dict, item_type="item", title=""):
         return False
     
     return True  # Already has 'simkl' key or normalization not needed
+
+def extract_title_and_year(title_str: str) -> tuple[str, int | None]:
+    """
+    Extract base title and 4-digit release year from a title or filename string.
+    Supports formats like:
+      "Teki Cometh (2024)" -> ("Teki Cometh", 2024)
+      "42 Up (1998)" -> ("42 Up", 1998)
+      "Teki.Cometh.2024" -> ("Teki Cometh", 2024)
+      "Blade Runner 2049 (2017)" -> ("Blade Runner 2049", 2017)
+      "Movie Title [2022]" -> ("Movie Title", 2022)
+    Returns:
+      (base_title, year) where year is an int or None.
+    """
+    if not title_str or not isinstance(title_str, str):
+        return "", None
+
+    title_clean = title_str.strip()
+
+    # 1. Matches "Title (YYYY)" or "Title [YYYY]" at the end of the string
+    m = re.search(r'^(.*?)\s*[\(\[]\s*(\b(?:19\d{2}|20\d{2})\b)\s*[\)\]]\s*$', title_clean)
+    if m and m.group(1).strip():
+        base = m.group(1).strip()
+        if '.' in base and ' ' not in base:
+            base = base.replace('.', ' ')
+        return base.strip(), int(m.group(2))
+
+    # 2. Matches "Title.YYYY" or "Title YYYY" or "Title_YYYY" at the end of the string
+    m2 = re.search(r'^(.*?)[.\s_-]+(\b(?:19\d{2}|20\d{2})\b)\s*$', title_clean)
+    if m2 and m2.group(1).strip():
+        base = m2.group(1).strip()
+        if '.' in base and ' ' not in base:
+            base = base.replace('.', ' ')
+        return base.strip(), int(m2.group(2))
+
+    # 3. Matches "(YYYY)" anywhere in the title (e.g. "Title (2024) 1080p")
+    m3 = re.search(r'[\(\[]\s*(\b(?:19\d{2}|20\d{2})\b)\s*[\)\]]', title_clean)
+    if m3:
+        year = int(m3.group(1))
+        base = re.sub(r'[\(\[]\s*' + str(year) + r'\s*[\)\]]', '', title_clean).strip()
+        base = re.sub(r'\s+', ' ', base).strip(' .-')
+        if '.' in base and ' ' not in base:
+            base = base.replace('.', ' ')
+        if base:
+            return base.strip(), year
+
+    return title_clean, None
 
 def search_movie(title, client_id, access_token, file_path=None):
     """
@@ -199,6 +247,106 @@ def search_movie(title, client_id, access_token, file_path=None):
             logger.warning(f"Simkl API: Anime search failed for '{title}'. Status: {response.status_code}")
     except requests.exceptions.RequestException as e:
         logger.warning(f"Simkl API: Network error during anime search for '{title}': {e}")
+
+    # 4. Try year tolerance fallback (+1 and -1 year) if initial searches returned no results
+    base_title, parsed_year = extract_title_and_year(title)
+    if not parsed_year and file_path:
+        _, parsed_year = extract_title_and_year(os.path.basename(file_path))
+
+    if parsed_year and 1900 <= parsed_year <= 2100:
+        candidate_years = [parsed_year + 1, parsed_year - 1]
+        logger.info(
+            f"Simkl API: All initial searches failed for '{title}'. Trying year tolerance (+/- 1 year) "
+            f"for base title '{base_title}' (original year: {parsed_year}, candidates: {candidate_years})..."
+        )
+        for alt_year in candidate_years:
+            alt_query = f"{base_title} ({alt_year})"
+            logger.info(f"Simkl API: Trying movie title search with adjusted year: '{alt_query}'...")
+            try:
+                params = {
+                    'q': alt_query,
+                    'extended': 'full',
+                    'client_id': client_id,
+                    'app-name': APP_NAME,
+                    'app-version': __version__
+                }
+                response = requests.get(f'{SIMKL_API_BASE_URL}/search/movie', headers=headers, params=params)
+                if response.status_code == 200:
+                    results_json = response.json()
+                    if isinstance(results_json, list) and results_json:
+                        movie_item = results_json[0]
+                        if 'movie' not in movie_item:
+                            movie_item = {'movie': movie_item}
+                        if 'movie' in movie_item and isinstance(movie_item.get('movie'), dict):
+                            _normalize_simkl_ids(movie_item['movie'], "movie object", alt_query)
+                        matched_year = movie_item['movie'].get('year')
+                        logger.info(
+                            f"Simkl API: Found movie via year-tolerant search (+/- 1 year): "
+                            f"'{movie_item['movie'].get('title', base_title)}' (Year: {matched_year}, Query: '{alt_query}')"
+                        )
+                        return movie_item
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Simkl API: Network error during year-tolerant movie search for '{alt_query}': {e}")
+
+            # Also try anime search with alt_query for anime movies
+            try:
+                params = {
+                    'q': alt_query,
+                    'extended': 'full',
+                    'client_id': client_id,
+                    'app-name': APP_NAME,
+                    'app-version': __version__
+                }
+                response = requests.get(f'{SIMKL_API_BASE_URL}/search/anime', headers=headers, params=params)
+                if response.status_code == 200:
+                    results_json = response.json()
+                    if isinstance(results_json, list) and results_json:
+                        for anime_item in results_json:
+                            if anime_item.get('type') == 'movie':
+                                _normalize_simkl_ids(anime_item, "anime movie", alt_query)
+                                result = {'movie': anime_item}
+                                simkl_id = anime_item.get('ids', {}).get('simkl') or anime_item.get('ids', {}).get('simkl_id')
+                                logger.info(
+                                    f"Simkl API: Found anime movie via year-tolerant search (+/- 1 year): "
+                                    f"'{anime_item.get('title', base_title)}' (ID: {simkl_id}, Query: '{alt_query}')"
+                                )
+                                return result
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Simkl API: Network error during year-tolerant anime search for '{alt_query}': {e}")
+
+        # Also try searching base_title without year if still no results, and check if result year is within +/- 1 year
+        if base_title and base_title.lower() != title.lower():
+            logger.info(f"Simkl API: Trying base title search without year: '{base_title}'...")
+            try:
+                params = {
+                    'q': base_title,
+                    'extended': 'full',
+                    'client_id': client_id,
+                    'app-name': APP_NAME,
+                    'app-version': __version__
+                }
+                response = requests.get(f'{SIMKL_API_BASE_URL}/search/movie', headers=headers, params=params)
+                if response.status_code == 200:
+                    results_json = response.json()
+                    if isinstance(results_json, list) and results_json:
+                        for item in results_json:
+                            cand = item.get('movie') if 'movie' in item else item
+                            cand_year = cand.get('year')
+                            if cand_year is not None:
+                                try:
+                                    cand_year_int = int(cand_year)
+                                    if abs(cand_year_int - parsed_year) <= 1:
+                                        movie_item = item if 'movie' in item else {'movie': item}
+                                        _normalize_simkl_ids(movie_item['movie'], "movie object", base_title)
+                                        logger.info(
+                                            f"Simkl API: Found movie via base title search within +/- 1 year: "
+                                            f"'{movie_item['movie'].get('title', base_title)}' (Year: {cand_year_int} vs requested {parsed_year})"
+                                        )
+                                        return movie_item
+                                except (ValueError, TypeError):
+                                    continue
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Simkl API: Network error during base title search for '{base_title}': {e}")
 
     logger.info(f"Simkl API: No movie results found for '{title}' after all search methods.")
     return None
@@ -1027,3 +1175,160 @@ def _validate_access_token(client_id, access_token):
         return response.status_code == 200
     except:
         return False
+
+def parse_simkl_url(url: str | None) -> tuple[str, int] | None:
+    """
+    Parse a Simkl web URL to extract media type and Simkl ID.
+    Supports formats like:
+      https://simkl.com/anime/2095944/sousou-no-frieren
+      https://simkl.com/tv/1690042/shogun
+      https://simkl.com/movies/12345/dune
+      https://simkl.com/movie/12345/dune
+      simkl.com/anime/2095944
+    Returns (media_type, simkl_id) or None.
+    media_type is normalized to 'anime', 'show' (for tv), or 'movie'.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    match = re.search(r'(?:https?://)?(?:www\.)?simkl\.com/(anime|tv|movies|movie)/(\d+)', url, re.IGNORECASE)
+    if not match:
+        return None
+    category = match.group(1).lower()
+    simkl_id = int(match.group(2))
+    if category == 'tv':
+        media_type = 'show'
+    elif category in ('movies', 'movie'):
+        media_type = 'movie'
+    else:
+        media_type = 'anime'
+    return media_type, simkl_id
+
+def _search_simkl_multi_categories(
+    query_str: str,
+    headers: dict,
+    client_id: str,
+    limit_per_category: int = 5,
+    seen_ids: set | None = None
+) -> list[dict]:
+    if seen_ids is None:
+        seen_ids = set()
+
+    params = {
+        'q': query_str.strip(),
+        'extended': 'full',
+        'client_id': client_id,
+        'app-name': APP_NAME,
+        'app-version': __version__
+    }
+
+    results = []
+    endpoints = [
+        ('/search/anime', 'anime'),
+        ('/search/tv', 'show'),
+        ('/search/movie', 'movie'),
+    ]
+
+    for endpoint, default_type in endpoints:
+        try:
+            url = f"{SIMKL_API_BASE_URL}{endpoint}"
+            resp = requests.get(url, headers=headers, params=params, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list):
+                    count = 0
+                    for item in data:
+                        if count >= limit_per_category:
+                            break
+                        media_obj = item.get('movie') or item.get('show') or item.get('anime') or item
+                        ids = media_obj.get('ids', {}) if isinstance(media_obj, dict) else {}
+                        simkl_id = ids.get('simkl') or ids.get('simkl_id') or media_obj.get('simkl_id')
+                        if not simkl_id:
+                            continue
+                        try:
+                            simkl_id = int(simkl_id)
+                        except (ValueError, TypeError):
+                            pass
+                        if simkl_id in seen_ids:
+                            continue
+                        seen_ids.add(simkl_id)
+
+                        item_type = media_obj.get('type') or default_type
+                        if item_type == 'tv':
+                            item_type = 'show'
+
+                        poster = None
+                        if 'poster' in media_obj:
+                            poster = media_obj['poster']
+                        elif 'poster_url' in media_obj:
+                            poster = media_obj['poster_url']
+                        elif 'images' in media_obj and isinstance(media_obj['images'], dict):
+                            poster = media_obj['images'].get('poster')
+
+                        if poster and isinstance(poster, str):
+                            poster = poster.strip()
+                            if poster and not poster.startswith("http://") and not poster.startswith("https://"):
+                                poster = f"https://simkl.net/posters/{poster}_m.jpg"
+
+                        results.append({
+                            "simkl_id": simkl_id,
+                            "type": item_type,
+                            "title": media_obj.get('title', 'Unknown'),
+                            "year": media_obj.get('year'),
+                            "poster_url": poster,
+                            "overview": media_obj.get('overview')
+                        })
+                        count += 1
+        except Exception as e:
+            logger.warning(f"Error querying Simkl endpoint {endpoint} for '{query_str}': {e}")
+
+    return results
+
+
+def search_simkl_multi(query: str, client_id: str, access_token: str | None = None, limit_per_category: int = 5) -> list[dict]:
+    """
+    Search Simkl across multiple categories (anime, tv shows, movies).
+    Returns a unified list of search results.
+    If no results are found and query contains a release year, retries with +/- 1 year tolerance.
+    """
+    if not query or not client_id:
+        return []
+
+    headers = {
+        'Content-Type': 'application/json',
+        'simkl-api-key': client_id,
+    }
+    if access_token:
+        headers['Authorization'] = f'Bearer {access_token}'
+    headers = _add_user_agent(headers)
+
+    seen_ids = set()
+    results = _search_simkl_multi_categories(query, headers, client_id, limit_per_category, seen_ids)
+    if results:
+        return results
+
+    # Fallback with +/- 1 year tolerance
+    base_query, parsed_year = extract_title_and_year(query)
+    if parsed_year and 1900 <= parsed_year <= 2100:
+        candidate_years = [parsed_year + 1, parsed_year - 1]
+        for alt_year in candidate_years:
+            alt_query = f"{base_query} ({alt_year})"
+            logger.info(f"Simkl API: Retrying multi-category search with adjusted year: '{alt_query}'")
+            alt_results = _search_simkl_multi_categories(alt_query, headers, client_id, limit_per_category, seen_ids)
+            if alt_results:
+                return alt_results
+
+        # Fallback: try base query without year, prioritizing candidates within +/- 1 year
+        if base_query and base_query.lower() != query.lower():
+            logger.info(f"Simkl API: Retrying multi-category search with base query: '{base_query}'")
+            base_results = _search_simkl_multi_categories(base_query, headers, client_id, limit_per_category, seen_ids)
+            filtered = [
+                item for item in base_results
+                if item.get("year") is not None and isinstance(item.get("year"), int) and abs(item["year"] - parsed_year) <= 1
+            ]
+            if filtered:
+                return filtered
+            if base_results:
+                return base_results
+
+    return results

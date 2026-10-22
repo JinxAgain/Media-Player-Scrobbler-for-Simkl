@@ -18,6 +18,9 @@
 - 🔄 **Reverse Playback Resume** – Automatically resumes unfinished media in MPV and PotPlayer from your Simkl saved position
 - ⏳ **Minimum Watch Time** – Configurable threshold before scrobbling to prevent accidental scrobbles
 - 💬 **Discord Rich Presence** – Shows movie/show title, season/episode, live playing/paused state, elapsed/total time progress bar, and Simkl poster image directly on your Discord profile
+- 🎯 **Manual Media Correction** – Correct unmatched or mismatched media on the fly via the tray dialog; supports Simkl URLs, numeric IDs, title searches, and season/episode overrides
+- 🗂️ **Persistent Custom Mappings** – Stores exact file and series-level matching rules (`custom_mappings.json`) to automatically identify future playback and series episodes
+- 📅 **Year-Tolerance Search** – Automatic ±1-year tolerance window fallback to resolve release year discrepancies between scene filenames and Simkl database records
 - 🔌 **Offline Support** – Queues updates when offline
 - 🧠 **Smart Media Detection** – Intelligent filename parsing
 - 🍿 **Media-Focused** – Optimized for every type of media (Movies,TV Shows and Anime)

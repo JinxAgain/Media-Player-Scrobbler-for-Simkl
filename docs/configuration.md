@@ -110,6 +110,111 @@ MPS for SIMKL includes native Discord Rich Presence integration via local Discor
 - Connects directly to your local Discord desktop client via local IPC socket.
 - If Discord is not running or closed during playback, it fails silently with debug logging and automatically backs off with a 30-second reconnection cooldown, ensuring zero disruption to media tracking.
 
+### Manual Media Correction Dialog
+
+When an active media playback is unidentified or mismatched by automatic detection, you can manually correct the media identification on the fly without stopping playback or restarting the application.
+
+#### Opening the Correction Dialog
+- **System Tray Menu**: Click `Scrobbling → Correct Current Media...` while media is active in a supported player.
+- **Unidentified Notification**: When automatic identification fails, a desktop notification alert is shown with a prompt to open manual correction.
+
+#### Search & Resolution Options
+The correction dialog provides a unified search bar supporting three input formats:
+1. **Simkl Web URL**: Paste the direct link to the media item on Simkl, for example:
+   - `https://simkl.com/anime/2095944/sousou-no-frieren`
+   - `https://simkl.com/tv/1690042/shogun`
+   - `https://simkl.com/movies/12345/dune`
+   The URL is parsed automatically for media category (`anime`, `show`, `movie`) and numeric ID, asynchronously retrieving metadata and poster artwork.
+2. **Numeric Simkl ID**: Enter the numerical Simkl ID (e.g. `2095944`) to fetch exact details directly from Simkl.
+3. **Keyword / Title Search**: Type a title or keyword (e.g. `Frieren` or `Dune`). Clicking **Search** queries Simkl's `/search/anime`, `/search/tv`, and `/search/movie` endpoints in the background, presenting candidate results in an interactive list with media type badges (`[ANIME]`, `[SHOW]`, `[MOVIE]`), release year, and Simkl ID.
+
+#### Season & Episode Calibration
+- For TV shows and anime, the dialog displays **Season** and **Episode** input fields pre-filled with currently detected values, allowing manual override before saving.
+- When selecting a movie candidate, season and episode controls are automatically disabled.
+- **Apply to all episodes of this show**: Check this box (enabled by default for TV and anime) to create a series-level mapping rule for the parent directory or show keyword. Future episodes in the same folder or series will automatically inherit the correct Simkl ID and title.
+
+#### Live Runtime Swap
+When clicking **Save & Apply**:
+1. **Rule Persistence**: Saves an exact file mapping and (if selected) a series rule to `custom_mappings.json`.
+2. **Session Cleanup**: If an active playback session (`/scrobble/start` or `/scrobble/pause`) was previously sent to Simkl under an incorrect Simkl ID, it is automatically removed via `/playback/delete`.
+3. **State & Cache Update**: Updates internal tracking state, purges stale cache entries, and updates `media_cache.json` with the new metadata and Simkl CDN poster image.
+4. **Service Synchronization**: Immediately pushes the updated media title, episode, and poster artwork to Discord Rich Presence, sends a desktop notification confirmation, and restarts real-time scrobble progress tracking with Simkl.
+
+---
+
+### Persistent Custom Mappings (`custom_mappings.json`)
+
+MPS for SIMKL stores user-defined media overrides in a dedicated JSON file named `custom_mappings.json` located in the application data folder:
+
+- **Windows**: `%USERPROFILE%\kavin\simkl-mps\custom_mappings.json`
+- **macOS**: `~/kavin/simkl-mps/custom_mappings.json`
+- **Linux**: `~/.local/share/kavin/simkl-mps/custom_mappings.json`
+
+You can open this file directly from the tray menu via **Maintenance → Open Custom Mappings**.
+
+#### File Structure
+```json
+{
+  "version": 1,
+  "exact_files": {
+    "dune.part.two.2024.1080p.mkv": {
+      "simkl_id": 1690042,
+      "type": "movie",
+      "title": "Dune: Part Two",
+      "season": null,
+      "episode": null,
+      "poster_url": "https://simkl.net/posters/20/20035305560d0e0a35_m.jpg",
+      "year": 2024,
+      "updated_at": "2026-10-22T19:00:00+00:00"
+    }
+  },
+  "show_rules": {
+    "sousou no frieren": {
+      "simkl_id": 2095944,
+      "type": "anime",
+      "title": "Frieren: Beyond Journey's End",
+      "default_season": 1,
+      "folder_keyword": "frieren",
+      "poster_url": "https://simkl.net/posters/19/1948291048381a1b2c_m.jpg",
+      "updated_at": "2026-10-22T19:00:00+00:00"
+    }
+  }
+}
+```
+
+#### Rule Precedence & Resolution Hierarchy
+When a media player opens a video file, MPS for SIMKL resolves media identity using the following strict priority chain:
+
+1. **Priority 1: Exact File Match (`exact_files`)**
+   - Matches the lowercase base filename (e.g. `dune.part.two.2024.1080p.mkv`) or raw window title against `exact_files`.
+   - Highest priority: overrides show rules, local cache, and online search results.
+2. **Priority 2: Series / Show Match (`show_rules`)**
+   - Checks if the file path contains the `folder_keyword` or matches the series rule key against the parent folder name, guessit title, or raw window title.
+   - Dynamically parses the episode and season numbers from the filename using standard patterns (`S01E05`, `1x05`, `E05`, etc.) or `guessit`, falling back to `default_season`.
+   - Overrides stale `media_cache.json` entries from previous incorrect identifications.
+3. **Priority 3: Local Media Cache (`media_cache.json`)**
+   - Fast lookup for previously identified media items to minimize API requests.
+4. **Priority 4: Simkl API Identification**
+   - Queries Simkl `/search/file` followed by category searches (`/search/movie`, `/search/tv`, `/search/anime`).
+
+#### Concurrency & Fault Tolerance
+- All reads and writes to `custom_mappings.json` are protected by internal thread locks.
+- Writes are performed atomically using temporary files to prevent file corruption in case of unexpected termination.
+- If invalid JSON syntax is introduced (such as from a manual editing error), the application automatically backs up the file to `custom_mappings.json.corrupted` and initializes a fresh configuration, preventing application crashes.
+
+---
+
+### Year-Tolerance Search
+
+Release groups frequently tag filenames with the festival screening year or production year (e.g. `Teki.Cometh.2024.1080p.mkv` or `42.Up.1998`), whereas Simkl's database may catalog the title by its official theatrical or streaming release year (e.g. 2025 or 1999).
+
+To prevent identification failures caused by release year discrepancies, MPS for SIMKL implements automatic ±1-year tolerance searching:
+
+- **Intelligent Year Extraction**: Parses release years enclosed in parentheses `(YYYY)`, brackets `[YYYY]`, or separated by dots/spaces while preserving titles containing numbers (such as `2001: A Space Odyssey`, `1917`, or `Blade Runner 2049 (2017)`).
+- **Tolerance Fallback Window**: If an exact search for `Title (YYYY)` returns no matches:
+  1. Automatically retries querying with `Title (YYYY + 1)` and `Title (YYYY - 1)`.
+  2. Queries the base title without year and filters candidates where $|CandidateYear - ParsedYear| \le 1$.
+- **Dual-Key Caching**: When a title is successfully matched via year tolerance, the result is cached in `media_cache.json` under both the queried filename/title key and the canonical Simkl title key, ensuring instantaneous future lookups without repeating fallback searches.
 
 ### Notifications
 
